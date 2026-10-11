@@ -2,8 +2,11 @@
 
 ## Unreleased
 
+## 1.3.138 — 2026-10-11
+
 - 修复继承全局 rust 引擎（槽配置未写 `inference_engine`）的槽不进内核看门狗的问题：CLI 重启预算用尽后按 60s/300s/900s 重启容器，用尽后标 fault 并通知，不再一直 `healthy:false`（#343）。
 - 已停止 / 已失效的槽位不再每 15 秒被 cli-node 守护进程 `docker exec` 一次，日志里不再刷 `[cli-node-guard] vm-xx No such container`。
+- 修复租户面板 ACL 白名单未包含 OpenAI 额度查询/重置与 Claude 重置券查询/兑换、密钥清零路径，导致自有槽位上对应按钮一律 403 的问题；仍按槽位与密钥归属校验（#351）。
 - 修复运行中槽位改绑另一条 SOCKS5 后仍挂在旧 `kin-eg-*` 网络、透明出口 IP 不变的问题：重载时若容器网络与当前绑定出口不一致则重建容器（cli-home / run / 磁盘 / machine-id 挂载保留），不再仅 `docker restart`。同一条代理改上游时也会重启 `kin-egress`，避免面板显示新出口、流量仍走旧出口（#325）。
 - pi 在消息序列里插入的空 `system` 控制项（`output_config.effort`，例如当前轮 `max`）不再被空内容清理丢掉，也不会和相邻 system 轮次合并。当前轮有效 effort 记入日志；不支持对话中途 `role=system` 的模型把最后一条消息级 effort 提升到顶层 `output_config.effort`。出站补 `mid-conversation-output-config-2026-07-01`（#328）。
 - 工具参数流式下发 `failover.eager_tool_streaming` 改为默认开启：未配置时给自定义工具加 `eager_input_streaming`，避免 Claude Code 经中转写大文件时静默触发 180 秒空闲超时。显式 `false` 仍关闭。已部署且 `routing.json` 里写了 `eager_tool_streaming: false` 的机器保持关闭，请到面板「重试与切号」打开（#339）。
@@ -11,10 +14,10 @@
 - 绑定 SOCKS5 / 本机出口后槽位 `proxy_cli_enabled` 不再被后续写入打回 `false`。OAuth 提交、创建后启动、重置、包导入和重绑都会把该标志与已绑定出口一起保存；调度不再把已绑出口的槽当成 `no_eligible_accounts`。启动时会修好已被这个 bug 写成 `false` 的现有槽位（#332）。
 - 5h/7d 闸线临近时（默认闸线下 5 个百分点）会按本请求规模准入：小请求或已确认缓存热请求仍可走；预估大额冷缓存（默认 10 万未命中 token，含 `max_tokens`）不再打到只剩约 1 个百分点余量的账号，先改选其他有余量账号，全池都在临界区则本地 429 `quota_guard_request_too_large`，不打上游。已达闸线仍拦截普通请求。粘性/占席请求同样过闸。临界区内成功结算后，读数未刷新前下一笔大请求也会被挡住；失败或取消释放预留。闸是尽力保护，不把美元换成官方百分比，也不截短上下文。设置「配额」可改临界带宽与阈值，默认开启（#342）。
 - 集群节点上的本地代理在管理台显示为「节点名local代理」（例如 `东京-01local代理`），控制面槽为「当前VPS local代理」。代理池仍共用一条 `px-local` 与绑定额度，绑定计数标明「所有节点共用」；节点分组写「出口为该节点本机」，控制面探测不再当成节点出口。租户只看到「local代理」，不暴露节点名或其他租户槽位。本次不改配额语义（#329）。
-- 面板一键更新会识别当前 Compose 项目，用独立助手重建并 `--force-recreate` 控制面，轮询健康、启动时版本和此前健康槽位的内核鉴权后再报告成功；不再只改磁盘 `VERSION` 就显示「已是最新」。无法识别实际服务时返回 `409` 并给出宿主机命令。升级到本版本这一次仍由旧版助手执行，新流程从下一次更新起生效；验收失败不会自动回滚，会保留失败状态与助手日志（#331）。
-- 控制面调用内核同时发送 `X-Kin-Internal-Token` 和 `x-internal-token`，兼容 1.3.120 前后的槽内核、源码内核和 api-kernel（#331）。
-- Codex Responses Lite（`gpt-6-astra` + `reasoning.context=all_turns`）累计加密推理历史超过 128 KiB 时，上游会在出字前返回结构化 `server_error`；网关原先只读 `error.status`，把外层 `status: 500` 落成 502。同一槽保留最新连续推理历史（上限 120 KiB）再试一次，并把上游 500 如实报成 500（#334，基于 @OneB1ank 的 #335）。`KIN_CODEX_REASONING_HISTORY_FALLBACK=0` 可关闭该恢复。
-- 租户（`user`）在自己的槽位上点「查询额度」「使用重置券」「Claude 限额查询 / 重置」，以及对自己的密钥「清零」「轮换」不再返回 403。之前前端按钮已对租户开放，但权限白名单漏了这些接口；归属校验不变，访问他人的槽位或密钥仍返回 404（#351）。
+- 面板一键更新会识别当前 Compose 项目，用独立助手重建并 `--force-recreate` 控制面，轮询健康、启动时版本和此前健康槽位的内核鉴权后再报告成功；不再只改磁盘 `VERSION` 就显示「已是最新」。无法识别实际服务时返回 `409` 并给出宿主机命令。升级到本版本这一次仍由旧版助手执行，新流程从下一次更新起生效；验收失败不会自动回滚，会保留失败状态与助手日志（#346，supersedes #331）。
+- 控制面调用内核同时发送 `X-Kin-Internal-Token` 和 `x-internal-token`，兼容 1.3.120 前后的槽内核、源码内核和 api-kernel（#346，supersedes #331）。
+- 修复 Codex Responses Lite（`gpt-6-astra` + `reasoning.context=all_turns`）累计加密推理历史超过 128 KiB 时上游在出字前返回结构化 `server_error`、网关把外层 `status: 500` 错报成 502 的问题：同一槽保留最新连续推理历史（上限 120 KiB）重试一次，并按上游如实返回 500（#334）。`KIN_CODEX_REASONING_HISTORY_FALLBACK=0` 可关闭该恢复。
+- 修复租户面板 ACL 白名单未包含 API 密钥轮换（`POST /api/panel/api-keys/:id/rotate`），导致租户对自己的密钥点「轮换」一律 403 的问题；仍按密钥归属校验（#357）。
 
 已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。启动时自动把「已绑定出口但 `proxy_cli_enabled=false`」的槽位修好。不要覆盖 `routing.json`：若其中明确写了 `eager_tool_streaming: false`，升级后仍关闭，需在面板「重试与切号」打开；新配置项 `routing.quota.guard_large_cold` / `critical_band` / `large_cold_uncached_tokens` 缺省即生效。无迁移、无新依赖，不必 `wrap-cli/sync`，二进制不变。不要覆盖 `vms/`、`data/`、`.env`。
 
