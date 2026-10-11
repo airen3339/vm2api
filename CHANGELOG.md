@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.139 — 2026-10-11
+
+- 租户日志按属主隔离：`GET /api/panel/request-logs/stats` 的错误集合、入站鉴权失败（含客户端 IP）与粘性命中只统计租户自己的请求，租户侧不再返回全站 `totals` / `config`。日志属主改为写入时快照槽位当时的属主（`usage_logs.vm_owner_user_id`），平台槽分配给租户后，分配前的历史日志不再对新属主可见。升级前的历史日志不回填，租户只能按自己的用户 / 密钥看到；此前租户在自己槽上用面板 test-chat 产生的旧日志将不可见（#353，@XiangZheng2283）。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。启动时执行迁移 `036_usage_logs_vm_owner.sql`（加列 + 索引，大表建索引期间短暂阻塞写入）。不必 `wrap-cli/sync`，二进制不变。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.3.138 — 2026-10-11
 
 - 修复继承全局 rust 引擎（槽配置未写 `inference_engine`）的槽不进内核看门狗的问题：CLI 重启预算用尽后按 60s/300s/900s 重启容器，用尽后标 fault 并通知，不再一直 `healthy:false`（#343）。
