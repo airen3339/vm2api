@@ -37,6 +37,15 @@ function body(user, extra = {}) {
   }
 }
 
+function codexBody(text, extra = {}) {
+  return {
+    model: 'gpt-6-astra',
+    instructions: 'You are Codex.',
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text }] }],
+    ...extra,
+  }
+}
+
 test('user document ignores a shared system prefix', () => {
   const a = body(longUser('attack-one'))
   const b = body(longUser('attack-two-completely-different-ask'))
@@ -57,6 +66,37 @@ test('a 10 percent tail edit stays at or above 90 percent and a 40 percent rewri
 
 test('short text has no similarity signature', () => {
   assert.equal(refusalSignature('too short to compare'), null)
+})
+
+test('a Responses input array carries the user turns', () => {
+  const doc = refusalUserDocument(codexBody(longUser('codex-payload')))
+  assert.notEqual(doc, '')
+  assert.equal(doc.includes('alpha beta gamma'), true)
+  assert.equal(doc.includes('you are codex'), false)
+})
+
+test('assistant and tool items never join the Responses user document', () => {
+  const doc = refusalUserDocument({
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'first ask' }] },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'assistant echo' }] },
+      { type: 'function_call_output', call_id: 'call-1', output: 'tool output' },
+      { type: 'input_text', text: 'second ask' },
+    ],
+  })
+  assert.equal(doc.includes('first ask'), true)
+  assert.equal(doc.includes('second ask'), true)
+  assert.equal(doc.includes('assistant echo'), false)
+  assert.equal(doc.includes('tool output'), false)
+})
+
+test('a Responses prompt with a small tail edit stays above the similarity line', () => {
+  const base = longUser('codex-payload')
+  const near = base.slice(0, Math.floor(base.length * 0.95)) + 'z'.repeat(Math.ceil(base.length * 0.05))
+  const baseSig = refusalSignature(refusalUserDocument(codexBody(base)))
+  assert.ok(baseSig)
+  const nearScore = signatureSimilarity(baseSig, refusalSignature(refusalUserDocument(codexBody(near))))
+  assert.ok(nearScore >= REFUSAL_SIMILARITY, `near ${nearScore}`)
 })
 
 test('stored near-duplicate blocks and then the device blocks any later prompt', () => {

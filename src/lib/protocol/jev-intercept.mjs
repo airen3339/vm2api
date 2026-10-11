@@ -669,10 +669,13 @@ export function jevModelDocument(inbound, body = inbound) {
     parts.push(norm)
   }
   for (const src of [inbound, body]) {
-    const system = src?.system
-    const blocks = typeof system === 'string' ? [system] : Array.isArray(system) ? system : []
-    for (const block of blocks) {
-      push(typeof block === 'string' ? block : block?.text)
+    // Responses carries the client system prompt as `instructions`.
+    for (const field of ['system', 'instructions']) {
+      const system = src?.[field]
+      const blocks = typeof system === 'string' ? [system] : Array.isArray(system) ? system : []
+      for (const block of blocks) {
+        push(typeof block === 'string' ? block : block?.text)
+      }
     }
   }
   const user = jevDocument(inbound, body)

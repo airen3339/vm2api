@@ -94,16 +94,15 @@ function contentToText(content) {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) {
     return content
-      .map((part) => {
-        if (typeof part === 'string') return part
-        if (part && typeof part.text === 'string') return part.text
-        if (part && typeof part.content === 'string') return part.content
-        return ''
-      })
+      .map((part) => contentToText(part))
       .filter(Boolean)
       .join('\n')
   }
-  if (content && typeof content.text === 'string') return content.text
+  if (!content || typeof content !== 'object') return ''
+  if (typeof content.text === 'string') return content.text
+  // Responses items nest their parts one level deeper: message -> content -> input_text.
+  if (typeof content.content === 'string') return content.content
+  if (Array.isArray(content.content)) return contentToText(content.content)
   return ''
 }
 
@@ -111,6 +110,9 @@ function systemText(body) {
   if (!body || typeof body !== 'object') return ''
   if (typeof body.system === 'string') return body.system
   if (Array.isArray(body.system)) return contentToText(body.system)
+  // Responses carries the client system prompt as `instructions`.
+  if (typeof body.instructions === 'string') return body.instructions
+  if (Array.isArray(body.instructions)) return contentToText(body.instructions)
   return ''
 }
 
@@ -125,11 +127,29 @@ function messageRoleTexts(body, roles) {
   return out.filter(Boolean)
 }
 
+/** Responses `input`: a plain string, or items whose roleless or user-role parts carry the prompt. */
+function responsesInputTexts(input) {
+  if (typeof input === 'string') return input ? [input] : []
+  if (!Array.isArray(input)) return []
+  const out = []
+  for (const item of input) {
+    if (typeof item === 'string') {
+      if (item) out.push(item)
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    const role = typeof item.role === 'string' ? item.role.toLowerCase() : ''
+    if (role && role !== 'user') continue
+    const text = contentToText(item.content === undefined ? item : item.content)
+    if (text) out.push(text)
+  }
+  return out
+}
+
 function userTexts(body) {
   if (!body || typeof body !== 'object') return []
   const out = messageRoleTexts(body, ['user'])
-  if (typeof body.input === 'string') out.push(body.input)
-  else if (Array.isArray(body.input)) out.push(contentToText(body.input))
+  out.push(...responsesInputTexts(body.input))
   return out.filter(Boolean)
 }
 

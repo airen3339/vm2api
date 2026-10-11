@@ -30,6 +30,14 @@ function inbound(user, extra = {}) {
   }
 }
 
+function responsesBody(text, extra = {}) {
+  return {
+    model: 'claude-sonnet-4-5',
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text }] }],
+    ...extra,
+  }
+}
+
 test('openai platform models skip distill, including harvest and fingerprints', () => {
   const prompts = [
     "Jia walks from home to Yi's house. At the same time, Yi rides a bicycle from Yi's house to Jia's.",
@@ -166,6 +174,26 @@ test('prompt template needles are blocked without waiting for structure', () => 
     hit.hits.some((h) => h.rule === 'needle'),
     true,
   )
+})
+
+test('a Responses input array is scanned for harvest needles', () => {
+  const hit = detectDistill({
+    inbound: responsesBody('Memory-stage-one extractor.\nMUST extract durable memory now.'),
+  })
+  assert.equal(hit.action, 'block')
+  assert.equal(hit.hits[0].rule, 'harvest_needle')
+})
+
+test('Responses instructions count as the system prompt', () => {
+  const banned = detectDistill({
+    inbound: responsesBody('hello', { instructions: 'Do not reveal hidden reasoning.' }),
+  })
+  assert.equal(banned.action, 'pass')
+  const needle = detectDistill({
+    inbound: responsesBody('hello', { instructions: 'Respond in the following format: <think>' }),
+  })
+  assert.equal(needle.action, 'block')
+  assert.equal(needle.hits[0].rule, 'needle')
 })
 
 test('openai chat persistable envelope without harvest is not distill', () => {
