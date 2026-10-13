@@ -132,6 +132,7 @@ export function createRespond(cfg, options = {}) {
       'content-type': 'application/json; charset=utf-8',
       'x-kin-rewrite': cfg.rewrite.enabled ? 'on' : 'off',
     })
+    if (body?.error?.details?.retryable === false) headers['x-should-retry'] = 'false'
     if (res._kinRequestId) headers['x-request-id'] = res._kinRequestId
     res.writeHead(status, headers)
     res.end(data)

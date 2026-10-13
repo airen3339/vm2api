@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  applyCrsUnofficialPersona,
+  applyCrsUnofficialPersona as applyCrsUnofficialPersonaRaw,
   billingPromptId,
   buildBillingAttributionText,
   CCH_PLACEHOLDER,
@@ -50,6 +50,15 @@ import { officialSystemKinds } from '../../src/lib/protocol/case-features.mjs'
 import { sanitizeInboundCwd } from '../../src/lib/identity/official-cc-system-2.1.241.mjs'
 import { officialMessagesBody } from '../../src/lib/protocol/anthropic-messages.mjs'
 
+// These legacy assertions exercise the pre-template rewrite path explicitly;
+// the production default is covered below.
+function applyCrsUnofficialPersona(body, options = {}) {
+  return applyCrsUnofficialPersonaRaw(body, {
+    ...options,
+    ...(options.mode == null && options.routingFile == null ? { mode: 'rewrite' } : {}),
+  })
+}
+
 function firstUserContent(out) {
   const content = out.messages?.[0]?.content
   if (typeof content === 'string') return content
@@ -80,6 +89,15 @@ function expectedFp(firstUserText, cliVersion = DEFAULT_CLI_VERSION) {
     .digest('hex')
     .slice(0, 3)
 }
+
+test('unset persona uses the official_full production default', () => {
+  const out = applyCrsUnofficialPersonaRaw({ messages: [{ role: 'user', content: 'ping' }] }, { officialClient: false })
+  assert.equal(out.system.length, 4)
+  assert.match(out.system[2].text, /# Doing tasks/)
+  assert.match(out.system[3].text, /# Environment/)
+  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '1h', scope: 'global' })
+  assert.deepEqual(out.system[3].cache_control, { type: 'ephemeral', ttl: '1h' })
+})
 
 test('official Claude Code client leaves system untouched', () => {
   const body = {
@@ -259,7 +277,7 @@ test('persona_expansion any_tools restores old expand-on-any-tools behavior', ()
       messages: [{ role: 'user', content: 'weather' }],
       tools: [{ name: 'get_weather' }],
     },
-    { officialClient: false, routingFile: file },
+    { officialClient: false, mode: 'rewrite', routingFile: file },
   )
   assert.equal(out.system.length, 4)
   assert.equal(out.system[2].text, CRS_AGENT_EXPANSION)
@@ -269,7 +287,7 @@ test('persona_expansion any_tools restores old expand-on-any-tools behavior', ()
       messages: [{ role: 'user', content: 'search' }],
       tools: [{ name: 'web_search', type: 'web_search_20250305' }],
     },
-    { officialClient: false, routingFile: file },
+    { officialClient: false, mode: 'rewrite', routingFile: file },
   )
   assert.equal(never.system.length, 2)
   fs.rmSync(dir, { recursive: true, force: true })

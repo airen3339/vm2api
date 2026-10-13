@@ -15,6 +15,12 @@ const SESSION_IDLE_MS = 60 * 60_000
 const sessions = new Map()
 const IMAGE_TYPES = new Set(['image', 'input_image', 'image_url'])
 
+function sessionCacheKey(sessionKey, bodyOrModel = null) {
+  const session = String(sessionKey || '').trim()
+  const model = typeof bodyOrModel === 'string' ? bodyOrModel : bodyOrModel?.model
+  return JSON.stringify([session, String(model || '')])
+}
+
 function digest(value) {
   return createHash('sha256')
     .update(JSON.stringify(value ?? null))
@@ -101,6 +107,7 @@ function comparePrefix(previous, current) {
         section: 'messages',
         index,
         kind: classifyParts(previous.messages[index], current.messages[index]),
+        ...messageBlockDifference(previous.messages[index], current.messages[index]),
       },
     }
   }
@@ -117,6 +124,32 @@ function classifyParts(previous, current) {
     if (left.digest !== right.digest) return left.kind
   }
   return 'structure'
+}
+
+/** Summarize block boundaries using hashes only; never expose prompt or hashes. */
+function messageBlockDifference(previous, current) {
+  if (
+    !previous ||
+    !current ||
+    previous.role !== current.role ||
+    !Array.isArray(previous.parts) ||
+    !Array.isArray(current.parts)
+  )
+    return {}
+  const shared = Math.min(previous.parts.length, current.parts.length)
+  let prefix = 0
+  while (
+    prefix < shared &&
+    previous.parts[prefix].kind === current.parts[prefix].kind &&
+    previous.parts[prefix].digest === current.parts[prefix].digest
+  )
+    prefix++
+  return {
+    blockIndex: prefix < shared || previous.parts.length !== current.parts.length ? prefix : null,
+    previousBlocks: previous.parts.length,
+    currentBlocks: current.parts.length,
+    sharedPrefixBlocks: prefix,
+  }
 }
 
 /**
@@ -170,10 +203,10 @@ export function describeCacheContinuity({
  * `confirmed` is true only after a successful hop called confirmCachePrefix.
  */
 export function peekCachePrefix(sessionKey, body, now = Date.now()) {
-  const key = String(sessionKey || '').trim()
-  if (!key || !body || typeof body !== 'object') return null
+  const session = String(sessionKey || '').trim()
+  if (!session || !body || typeof body !== 'object') return null
   const current = snapshotBody(body)
-  const hit = sessions.get(key)
+  const hit = sessions.get(sessionCacheKey(session, body))
   const previous = hit && now - hit.at < SESSION_IDLE_MS ? hit : null
   const compared = comparePrefix(previous, current)
   return { ...compared, confirmed: !!previous?.confirmed }
@@ -185,8 +218,10 @@ export function peekCachePrefix(sessionKey, body, now = Date.now()) {
  * the next estimate treat the session as warm.
  */
 export function trackCachePrefix(sessionKey, body, now = Date.now()) {
-  const key = String(sessionKey || '').trim()
-  if (!key || !body || typeof body !== 'object') return null
+  const session = String(sessionKey || '').trim()
+  if (!session || !body || typeof body !== 'object') return null
+  // Auxiliary models sharing a client session have independent cache histories.
+  const key = sessionCacheKey(session, body)
   const current = snapshotBody(body)
   const hit = sessions.get(key)
   const previous = hit && now - hit.at < SESSION_IDLE_MS ? hit : null
@@ -199,9 +234,14 @@ export function trackCachePrefix(sessionKey, body, now = Date.now()) {
 
 /** Mark the latest attempted snapshot as a confirmed cache write/read. */
 export function confirmCachePrefix(sessionKey, now = Date.now()) {
-  const key = String(sessionKey || '').trim()
-  if (!key) return false
-  const hit = sessions.get(key)
+  const session = String(sessionKey || '').trim()
+  if (!session) return false
+  let hit = null
+  for (const [key, candidate] of sessions) {
+    try {
+      if (JSON.parse(key)?.[0] === session && (!hit || candidate.at > hit.at)) hit = candidate
+    } catch {}
+  }
   if (!hit || now - hit.at >= SESSION_IDLE_MS) return false
   hit.confirmed = true
   return true

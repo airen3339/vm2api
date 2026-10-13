@@ -1,5 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { createDatabase } from '../../src/lib/db/database.mjs'
+import { RefusalGuardsRepo } from '../../src/lib/db/repos/refusal-guards-repo.mjs'
+import { RefusalDeviceBlocksRepo } from '../../src/lib/db/repos/refusal-device-blocks-repo.mjs'
+import { refusalFingerprint, refusalPromptSignature } from '../../src/lib/core/refusal-guard.mjs'
 import {
   parseCountTokensBody,
   buildUsageView,
@@ -182,7 +189,7 @@ test('distill count_tokens returns distill_blocked and never peeks or hops', asy
   assert.equal(cap.calls[0].body.error.code, 'distill_blocked')
 })
 
-test('refusal-cache count_tokens returns 503 and never peeks or hops', async () => {
+test('refusal-cache count_tokens returns a non-retryable 403 and never peeks or hops', async () => {
   const cap = jsonCapture()
   let peeked = false
   let hopped = false
@@ -221,11 +228,12 @@ test('refusal-cache count_tokens returns 503 and never peeks or hops', async () 
   assert.equal(peeked, false)
   assert.equal(hopped, false)
   assert.equal(hits, 1)
-  assert.equal(cap.calls[0].status, 503)
+  assert.equal(cap.calls[0].status, 403)
   assert.equal(cap.calls[0].body.error.code, 'refusal_guard')
+  assert.deepEqual(cap.calls[0].body.error.details, { blocked_by: 'exact', retryable: false })
 })
 
-test('device-banned count_tokens returns 503 and never peeks or hops', async () => {
+test('device-banned count_tokens returns a non-retryable 403 with its source and never peeks or hops', async () => {
   const cap = jsonCapture()
   let peeked = false
   let hopped = false
@@ -244,7 +252,10 @@ test('device-banned count_tokens returns 503 and never peeks or hops', async () 
       settings: { get: () => true },
       refusalGuards: { get: () => null, hit: () => {}, nearest: () => null },
       refusalDevices: {
-        get: (id) => (id === 'device-12345678' ? { device_id: id } : null),
+        get: (id) =>
+          id === 'device-12345678'
+            ? { device_id: id, source_request_id: '36e239bf-7e70-4a79-80fd-c8a717ff464b' }
+            : null,
         hit: () => {
           hits += 1
         },
@@ -266,8 +277,93 @@ test('device-banned count_tokens returns 503 and never peeks or hops', async () 
   assert.equal(peeked, false)
   assert.equal(hopped, false)
   assert.equal(hits, 1)
-  assert.equal(cap.calls[0].status, 503)
+  assert.equal(cap.calls[0].status, 403)
   assert.equal(cap.calls[0].body.error.code, 'refusal_guard')
+  assert.deepEqual(cap.calls[0].body.error.details, {
+    blocked_by: 'device',
+    retryable: false,
+    source_request_id: '36e239bf-7e70-4a79-80fd-c8a717ff464b',
+  })
+})
+
+test('count_tokens with device block off permits benign traffic and keeps exact/near blocks without writing device history', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-count-device-off-'))
+  const db = createDatabase({ dataDir: dir })
+  try {
+    const guards = new RefusalGuardsRepo(db)
+    const devices = new RefusalDeviceBlocksRepo(db)
+    const text = 'payload alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu '.repeat(40)
+    const makeBody = (content) => ({ model: 'claude-opus-5', messages: [{ role: 'user', content }] })
+    const original = makeBody(text)
+    const fingerprint = refusalFingerprint(original)
+    guards.remember({
+      fingerprint,
+      model: original.model,
+      signature: refusalPromptSignature(original),
+      errorMessage: 'violate our Usage Policy',
+      requestId: '36e239bf-7e70-4a79-80fd-c8a717ff464b',
+    })
+    devices.block({
+      deviceId: 'device-historic-1234',
+      fingerprint,
+      requestId: '36e239bf-7e70-4a79-80fd-c8a717ff464b',
+    })
+    const history = devices.list()
+    const settings = new Map([
+      ['refusal_device_block_enabled', false],
+      ['refusal_similarity_enabled', true],
+      ['jev_intercept', { enabled: false, hard_regex_enabled: false }],
+    ])
+    for (const deviceId of ['device-historic-1234', 'device-fresh-123456']) {
+      for (const kind of ['benign', 'exact', 'similar']) {
+        const cap = jsonCapture()
+        let peeks = 0
+        let hops = 0
+        const inbound = makeBody(
+          kind === 'benign'
+            ? 'How do I list local files?'
+            : kind === 'exact'
+              ? text
+              : text.slice(0, -20) + 'edited tail',
+        )
+        await handleUserCountTokens(
+          { headers: { 'x-kin-device-id': deviceId } },
+          {},
+          {
+            json: cap.json,
+            requireAuth: () => true,
+            readBody: async () => inbound,
+            cfg: { limits: { max_body_bytes: 16384 }, distill: { enabled: false } },
+            settings: { get: (key, fallback) => (settings.has(key) ? settings.get(key) : fallback) },
+            refusalGuards: guards,
+            refusalDevices: devices,
+            getPoolScheduler: () => ({
+              peekAccount: async () => {
+                peeks += 1
+                return { ok: true, vmId: 'vm-01', accountId: 'acc-1', vm: { credential_mode: 'setup-token' }, exec: {} }
+              },
+            }),
+            countTokensViaWorker: async () => {
+              hops += 1
+              return { ok: true, status: 200, body: { input_tokens: 42 } }
+            },
+          },
+        )
+        assert.equal(cap.calls[0].status, kind === 'benign' ? 200 : 403, `${deviceId}: ${kind}`)
+        assert.equal(peeks, kind === 'benign' ? 1 : 0)
+        assert.equal(hops, kind === 'benign' ? 1 : 0)
+        if (kind !== 'benign') assert.equal(cap.calls[0].body.error.details.blocked_by, kind)
+        assert.deepEqual(devices.list(), history)
+        assert.equal(devices.count(), 1)
+        assert.equal(guards.count(), 1)
+      }
+    }
+    assert.equal(guards.get(fingerprint).hit_count, 4)
+    assert.equal(devices.get('device-fresh-123456'), null)
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('setup-token usage uses Extra and does not hop', async () => {

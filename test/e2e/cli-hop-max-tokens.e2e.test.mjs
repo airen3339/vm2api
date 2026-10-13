@@ -6,10 +6,12 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
+import { listCacheMarkers } from '../../src/lib/protocol/cache-ttl.mjs'
 
 const cli = fileURLToPath(new URL('../../share/wrap-cli/cli-node', import.meta.url))
 
-async function runTurn(t, stopReason, apiError = false, httpError = null) {
+async function runTurn(t, stopReason, apiError = false, httpError = null, requestBody = null) {
   const home = mkdtempSync(path.join(os.tmpdir(), 'cli-hop-limit-'))
   t.after(() => rmSync(home, { recursive: true, force: true }))
   const events = [
@@ -41,6 +43,7 @@ async function runTurn(t, stopReason, apiError = false, httpError = null) {
         ]),
   ]
   const requests = []
+  const betaHeaders = []
   const upstream = http.createServer(async (req, res) => {
     let raw = ''
     for await (const chunk of req) raw += chunk
@@ -49,6 +52,24 @@ async function runTurn(t, stopReason, apiError = false, httpError = null) {
       return
     }
     requests.push(JSON.parse(raw))
+    betaHeaders.push(req.headers['anthropic-beta'] || '')
+    if (
+      requestBody &&
+      requests.at(-1).thinking?.display === 'updates' &&
+      !String(req.headers['anthropic-beta'] || '').includes('thinking-display-updates-2026-08-18')
+    ) {
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(
+        JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: 'thinking-display-updates beta is required',
+          },
+        }),
+      )
+      return
+    }
     if (httpError) {
       res.writeHead(httpError.status, { 'content-type': 'application/json', 'retry-after': '13' })
       res.end(
@@ -132,7 +153,7 @@ async function runTurn(t, stopReason, apiError = false, httpError = null) {
               type: 'job_start',
               job_id: 'limit-job',
               slot_id: frame.slot_id,
-              request: {
+              request: requestBody || {
                 model: 'claude-opus-5-5',
                 max_tokens: 128,
                 stream: true,
@@ -149,9 +170,106 @@ async function runTurn(t, stopReason, apiError = false, httpError = null) {
   return {
     terminal,
     requests,
+    betaHeaders,
     events: frames.filter((frame) => frame.type === 'stream_event').map((frame) => frame.event),
   }
 }
+
+for (const cacheTtl of ['5m', '1h']) {
+  for (const repaired of [false, true]) {
+    const toolCount = repaired ? 125 : 2
+    test(`native CLI preserves merged Sonnet history anchors, ttl=${cacheTtl}, repaired=${repaired}, tools=${toolCount}`, {
+      timeout: 20000,
+    }, async (t) => {
+      const blocks = Array.from({ length: 106 }, (_, i) => ({ type: 'text', text: `History block ${i}.` }))
+      const body = prepareCliHopBody(
+        {
+          model: 'claude-sonnet-5.5',
+          max_tokens: 2112,
+          thinking: { type: 'adaptive', display: 'updates' },
+          system: [{ type: 'text', text: 'Synthetic cache regression context.' }],
+          tools: Array.from({ length: toolCount }, (_, i) => ({
+            name: `fixture_tool_${i}`,
+            description: 'Inert tool.',
+            input_schema: { type: 'object', properties: {} },
+          })),
+          messages: [
+            { role: 'user', content: blocks.slice(0, 1) },
+            { role: 'user', content: blocks.slice(1) },
+          ],
+        },
+        { cacheTtl, repaired },
+      )
+      const result = await runTurn(t, 'end_turn', false, null, body)
+      assert.equal(result.terminal.type, 'job_done')
+      assert.equal(result.requests.length, 1)
+      const wire = result.requests[0]
+      assert.deepEqual(wire.messages, body.messages, 'native CLI keeps the message text, roles and both markers')
+      assert.deepEqual(
+        wire.tools.map((tool) => tool.name),
+        body.tools.map((tool) => tool.name),
+      )
+      assert.deepEqual(wire.thinking, { type: 'adaptive', display: 'updates' })
+      assert.match(result.betaHeaders[0], /thinking-display-updates-2026-08-18/)
+      assert.equal(wire.max_tokens, 2112)
+      const markers = listCacheMarkers(wire)
+      assert.deepEqual(
+        markers.filter((marker) => marker.section === 'messages').map((marker) => marker.blockIndex),
+        [103, 105],
+      )
+      assert.equal(
+        markers.length,
+        4,
+        'native system/tools markers plus history and tail stay within the provider limit',
+      )
+      assert.ok(markers.every((marker) => marker.ttl === cacheTtl))
+      t.diagnostic(JSON.stringify({ kind: 'sonnet_native_wire_markers', cacheTtl, repaired, markers }))
+    })
+  }
+}
+
+test('native CLI sends updates for incoming adaptive thinking and preserves complete response', {
+  timeout: 20000,
+}, async (t) => {
+  const body = prepareCliHopBody({
+    model: 'claude-opus-5.5',
+    max_tokens: 128000,
+    thinking: { type: 'adaptive', display: 'updates' },
+    output_config: { effort: 'high' },
+    tools: Array.from({ length: 125 }, (_, i) => ({
+      name: `fixture_tool_${i + 1}`,
+      description: 'Inert diagnostic tool.',
+      input_schema: { type: 'object', properties: {} },
+    })),
+    messages: [
+      { role: 'user', content: Array.from({ length: 9 }, (_, i) => ({ type: 'text', text: `Context ${i + 1}.` })) },
+      { role: 'system', content: 'Print integers.' },
+    ],
+  })
+  const result = await runTurn(t, 'end_turn', false, null, body)
+  assert.equal(result.terminal.type, 'job_done')
+  assert.equal(result.requests.length, 1)
+  assert.deepEqual(result.requests[0].thinking, { type: 'adaptive', display: 'updates' })
+  assert.match(result.betaHeaders[0], /thinking-display-updates-2026-08-18/)
+  assert.equal(result.requests[0].max_tokens, 128000)
+  assert.equal(result.requests[0].output_config.effort, 'high')
+  assert.equal(result.requests[0].tools.length, 125)
+  assert.deepEqual(
+    result.requests[0].messages.map((message) => message.role),
+    ['user', 'system'],
+  )
+  assert.equal(result.requests[0].messages[0].content.length, 9)
+  assert.equal(result.events.find((event) => event.type === 'content_block_delta').delta.text, '1 2 3 4 5')
+  assert.equal(result.events.find((event) => event.type === 'message_delta').delta.stop_reason, 'end_turn')
+  assert.equal(result.events.filter((event) => event.type === 'message_stop').length, 1)
+  t.diagnostic(
+    JSON.stringify({
+      kind: 'native_wire_capture',
+      thinking: result.requests[0].thinking,
+      betas: result.betaHeaders[0],
+    }),
+  )
+})
 
 for (const stopReason of ['max_tokens', 'end_turn']) {
   test(`native CLI preserves ${stopReason}, generated content and real usage`, { timeout: 20000 }, async (t) => {

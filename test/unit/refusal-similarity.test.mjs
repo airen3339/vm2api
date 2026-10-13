@@ -21,6 +21,7 @@ import {
   refusalUserDocument,
   signatureSimilarity,
 } from '../../src/lib/core/refusal-similarity.mjs'
+import { runProtocolIntercept } from '../../src/lib/protocol/intercept-gate.mjs'
 
 function longUser(seed, extra = '') {
   const chunk = `${seed} alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu `
@@ -135,6 +136,71 @@ test('stored near-duplicate blocks and then the device blocks any later prompt',
   }
 })
 
+for (const kind of ['exact', 'similar', 'device']) {
+  test(`${kind} refusal is non-retryable and preserves the prompt and device blocks`, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-refusal-contract-'))
+    const db = createDatabase({ dataDir: dir })
+    try {
+      const guards = new RefusalGuardsRepo(db)
+      const devices = new RefusalDeviceBlocksRepo(db)
+      const deviceId = 'device-aaaabbbbcccc'
+      const sourceRequestId = '36e239bf-7e70-4a79-80fd-c8a717ff464b'
+      const requestId = 'b739425c-a834-4d43-8a8a-01e25243e8cb'
+      const metadata = { user_id: { device_id: deviceId, session_id: 'sess-1' } }
+      const original = body(longUser('payload'), { metadata })
+      const fingerprint = refusalFingerprint(original)
+      guards.remember({
+        fingerprint,
+        model: original.model,
+        requestId: sourceRequestId,
+        errorMessage: 'Claude Code is unable to respond to this request, which appears to violate our Usage Policy',
+        preview: 'private original prompt',
+        signature: refusalPromptSignature(original),
+      })
+      let inbound = original
+      if (kind === 'similar') {
+        inbound = body(longUser('payload').slice(0, -20) + 'edited tail', { metadata })
+        assert.notEqual(refusalFingerprint(inbound), fingerprint)
+      }
+      if (kind === 'device') {
+        devices.block({ deviceId, requestId: sourceRequestId, fingerprint, reason: 'refusal_guard' })
+        inbound = body('an unrelated short question from another session', {
+          metadata: { user_id: { device_id: deviceId, session_id: 'sess-2' } },
+        })
+      }
+      const decision = await runProtocolIntercept({
+        inbound,
+        policy: refusalGuardPolicy(),
+        jev: { enabled: false, hard_regex_enabled: false },
+        repo: guards,
+        devices,
+        requestId,
+      })
+      assert.equal(decision.action, 'block')
+      assert.equal(decision.kind, kind)
+      assert.equal(decision.error.status, 403)
+      assert.equal(decision.error.body.error.code, 'refusal_guard')
+      assert.equal(decision.error.body.error.type, 'permission_error')
+      assert.equal(decision.error.body.error.details.blocked_by, kind)
+      assert.equal(decision.error.body.error.details.retryable, false)
+      assert.equal(decision.error.body.error.request_id, requestId)
+      assert.equal(decision.error.body.error.details.source_request_id, kind === 'device' ? sourceRequestId : undefined)
+      assert.match(decision.error.body.error.message, new RegExp(kind === 'exact' ? 'exact request' : kind))
+      assert.equal(JSON.stringify(decision.error).includes('private original prompt'), false)
+      assert.equal(JSON.stringify(decision.error).includes(deviceId), false)
+      assert.equal(guards.count(), 1)
+      assert.equal(guards.get(fingerprint).expires_at, null)
+      assert.equal(guards.get(fingerprint).hit_count, kind === 'device' ? 0 : 1)
+      assert.equal(devices.count(), 1)
+      assert.equal(devices.get(deviceId).source_request_id, kind === 'device' ? sourceRequestId : requestId)
+      assert.equal(devices.get(deviceId).hit_count, kind === 'device' ? 1 : 0)
+    } finally {
+      db.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
 test('different user text under the same system is not a near match', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-near-'))
   const db = createDatabase({ dataDir: dir })
@@ -210,5 +276,63 @@ test('turning similarity or device block off skips that check', () => {
     )
   } finally {
     db.close()
+  }
+})
+
+test('device block off permits benign same-device traffic while exact and near refusals still block without changing device history', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-refusal-device-off-'))
+  const db = createDatabase({ dataDir: dir })
+  try {
+    const guards = new RefusalGuardsRepo(db)
+    const devices = new RefusalDeviceBlocksRepo(db)
+    const historicDevice = 'device-historic-1234'
+    const original = body(longUser('payload'))
+    const fingerprint = refusalFingerprint(original)
+    guards.remember({
+      fingerprint,
+      model: original.model,
+      signature: refusalPromptSignature(original),
+      requestId: '36e239bf-7e70-4a79-80fd-c8a717ff464b',
+      errorMessage: 'violate our Usage Policy',
+    })
+    devices.block({ deviceId: historicDevice, requestId: '36e239bf-7e70-4a79-80fd-c8a717ff464b', fingerprint })
+    const history = devices.list()
+    const policy = { ...refusalGuardPolicy(), device_block_enabled: false, similarity_enabled: true }
+    for (const deviceId of [historicDevice, 'device-fresh-123456']) {
+      for (const kind of ['benign', 'exact', 'similar']) {
+        const inbound = body(
+          kind === 'benign'
+            ? 'How do I list local files?'
+            : kind === 'exact'
+              ? longUser('payload')
+              : longUser('payload').slice(0, -20) + 'edited tail',
+          {
+            metadata: { user_id: { device_id: deviceId, session_id: `session-${kind}` } },
+          },
+        )
+        const decision = await runProtocolIntercept({
+          inbound,
+          policy,
+          repo: guards,
+          devices,
+          jev: { enabled: false, hard_regex_enabled: false },
+          requestId: `current-${kind}`,
+        })
+        assert.equal(decision.action, kind === 'benign' ? 'pass' : 'block', `${deviceId}: ${kind}`)
+        if (kind !== 'benign') {
+          assert.equal(decision.kind, kind)
+          assert.equal(decision.error.status, 403)
+          assert.equal(decision.error.body.error.details.blocked_by, kind)
+        }
+        assert.deepEqual(devices.list(), history)
+        assert.equal(devices.count(), 1)
+        assert.equal(guards.count(), 1)
+      }
+    }
+    assert.equal(guards.get(fingerprint).hit_count, 4)
+    assert.equal(devices.get('device-fresh-123456'), null)
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
   }
 })

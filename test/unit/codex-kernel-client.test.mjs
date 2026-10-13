@@ -1,7 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import path from 'node:path'
-import { codexKernelPaths, withCodexKernelExec } from '../../src/lib/transport/codex-kernel-client.mjs'
+import http from 'node:http'
+import {
+  codexKernelPaths,
+  streamCodexKernel,
+  withCodexKernelExec,
+} from '../../src/lib/transport/codex-kernel-client.mjs'
 import {
   ensureCodexKernel,
   stopCodexKernel,
@@ -62,7 +67,7 @@ test('writeCodexKernelConfig writes bound SOCKS proxy', () => {
   assert.equal(cfg.proxy_url, 'socks5h://127.0.0.1:1080')
   assert.equal(cfg.socket_path, written.socketPath)
   assert.equal(cfg.internal_token, 'secret')
-  assert.equal(cfg.max_request_bytes, 32 * 1024 * 1024)
+  assert.equal(cfg.max_request_bytes, 129 * 1024 * 1024)
   fs.rmSync(root, { recursive: true, force: true })
 })
 
@@ -127,4 +132,164 @@ test('codex kernel starts without inherited proxy variables', async (t) => {
     keys.filter((k) => /_proxy$/i.test(k)),
     [],
   )
+})
+
+const unixTest = process.platform !== 'win32' ? test : test.skip
+
+/** A fake kin-codex-kernel: same socket, token and `event: response` SSE framing. */
+async function fakeKernel(t, writeStream) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-stream-'))
+  const slot = path.join(root, 'vm-codex')
+  const runDir = path.join(slot, 'run')
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'internal.token'), 'internal-test\n', { mode: 0o600 })
+  const server = http.createServer(async (req, res) => {
+    for await (const _ of req);
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-terminal-state': 'verified' })
+    await writeStream(res)
+    res.end()
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(path.join(runDir, 'codex-kernel.sock'), resolve)
+  })
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  return { vmId: 'vm-codex', homeDir: path.join(slot, 'cli-home'), vm: {} }
+}
+
+function sse(event) {
+  return `event: response\ndata: ${JSON.stringify(event)}\n\n`
+}
+
+const CREATED = { type: 'response.created', response: { id: 'resp_1', status: 'in_progress' } }
+const ITEM_ADDED = { type: 'response.output_item.added', output_index: 0, item: { id: 'msg_1', type: 'message' } }
+const TEXT_DELTA = { type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: 'hi' }
+const ITEM_DONE = { type: 'response.output_item.done', output_index: 0, item: { id: 'msg_1', type: 'message' } }
+const COMPLETED = {
+  type: 'response.completed',
+  response: { id: 'resp_1', status: 'completed', model: 'gpt-test', usage: { input_tokens: 7, output_tokens: 2 } },
+}
+
+async function runStream(exec) {
+  const lines = []
+  const result = await streamCodexKernel({
+    exec,
+    envelope: { body: { model: 'gpt-test', input: 'hi', stream: true }, stream: true, session: {} },
+    onEvent: async (line) => lines.push(line),
+  })
+  return { result, lines }
+}
+
+unixTest('a Responses stream that reaches response.completed is delivered', async (t) => {
+  const exec = await fakeKernel(t, async (res) => {
+    for (const event of [CREATED, ITEM_ADDED, ITEM_DONE, COMPLETED]) res.write(sse(event))
+  })
+  const { result, lines } = await runStream(exec)
+  assert.equal(result.ok, true)
+  assert.equal(result.body.id, 'resp_1')
+  assert.equal(result.usage.input_tokens, 7)
+  assert.equal(result.streamDiagnostics.terminal, 'completed')
+  assert.ok(lines.some((line) => line.includes('"response.completed"')))
+})
+
+unixTest('a kernel stream that ends after output without a terminal event names the upstream close', async (t) => {
+  const exec = await fakeKernel(t, async (res) => {
+    for (const event of [CREATED, ITEM_ADDED, ITEM_DONE]) res.write(sse(event))
+  })
+  const { result, lines } = await runStream(exec)
+  assert.equal(result.ok, false)
+  assert.equal(result.committed, true)
+  assert.equal(result.status, 200)
+  assert.equal(result.body.error.code, 'codex_upstream')
+  assert.match(result.body.error.message, /before response\.completed/)
+  assert.match(result.body.error.message, /response\.output_item\.done/)
+  assert.equal(result.streamDiagnostics.terminal, null)
+  assert.equal(result.streamDiagnostics.last_event, 'response.output_item.done')
+  assert.ok(lines.length > 0)
+})
+
+unixTest('a kernel stream that ends before any output is a 502, never a 200', async (t) => {
+  const exec = await fakeKernel(t, async (res) => {
+    res.write(sse(CREATED))
+  })
+  const { result, lines } = await runStream(exec)
+  assert.equal(result.ok, false)
+  assert.equal(result.committed, false)
+  assert.equal(result.status, 502)
+  assert.equal(result.body.error.code, 'codex_upstream')
+  assert.deepEqual(lines, [])
+})
+
+for (const output of [false, true]) {
+  unixTest(
+    `a streamed server_error ${output ? 'after output stays committed' : 'before output stays eligible for failover'}`,
+    async (t) => {
+      const error = {
+        type: 'error',
+        error: { type: 'server_error', code: 'server_error', message: 'processing request failed' },
+      }
+      const exec = await fakeKernel(t, async (res) => {
+        for (const event of [CREATED, ...(output ? [ITEM_ADDED, TEXT_DELTA] : []), error]) res.write(sse(event))
+      })
+      const { result, lines } = await runStream(exec)
+      assert.equal(result.ok, false)
+      assert.equal(result.committed, output)
+      assert.equal(result.status, output ? 200 : 502)
+      assert.equal(result.terminalState, 'incomplete')
+      assert.equal(result.body.error.code, 'server_error')
+      assert.equal(result.streamDiagnostics.terminal, 'error')
+      assert.equal(result.streamDiagnostics.last_event, 'error')
+      assert.equal(result.streamDiagnostics.committed, output)
+      if (output) assert.ok(result.ttftMs != null)
+      else assert.equal(result.ttftMs, null)
+      if (output) assert.ok(lines.some((line) => line.includes('"code":"server_error"')))
+      else assert.deepEqual(lines, [])
+    },
+  )
+}
+
+unixTest('response.failed with no output before it still reaches the client with its code', async (t) => {
+  const failed = {
+    type: 'response.failed',
+    response: { id: 'resp_1', status: 'failed', error: { code: 'context_length_exceeded', message: 'too long' } },
+  }
+  const exec = await fakeKernel(t, async (res) => {
+    for (const event of [CREATED, failed]) res.write(sse(event))
+  })
+  const { result, lines } = await runStream(exec)
+  assert.equal(result.ok, false)
+  assert.equal(result.committed, true)
+  assert.equal(result.body.error.code, 'context_length_exceeded')
+  assert.ok(lines.some((line) => line.includes('"response.failed"')))
+})
+
+unixTest('response.completed with no output events is still delivered whole', async (t) => {
+  const exec = await fakeKernel(t, async (res) => {
+    for (const event of [CREATED, COMPLETED]) res.write(sse(event))
+  })
+  const { result, lines } = await runStream(exec)
+  assert.equal(result.ok, true)
+  assert.ok(lines.some((line) => line.includes('"response.created"')))
+  assert.ok(lines.some((line) => line.includes('"response.completed"')))
+})
+
+unixTest('a multi-byte character split across socket chunks arrives intact', async (t) => {
+  const delta = { type: 'response.output_text.delta', output_index: 0, delta: '断流修复' }
+  const exec = await fakeKernel(t, async (res) => {
+    res.write(sse(CREATED) + sse(ITEM_ADDED))
+    const bytes = Buffer.from(sse(delta), 'utf8')
+    const cut = bytes.indexOf(Buffer.from('流', 'utf8')) + 1
+    res.write(bytes.subarray(0, cut))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    res.write(bytes.subarray(cut))
+    res.write(sse(COMPLETED))
+  })
+  const { result, lines } = await runStream(exec)
+  assert.equal(result.ok, true)
+  const line = lines.find((l) => l.includes('output_text.delta'))
+  assert.match(line, /断流修复/)
+  assert.doesNotMatch(line, /�/)
 })

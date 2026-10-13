@@ -627,6 +627,28 @@ export function applyMessageBreakpoints(body, ttl = DEFAULT_CACHE_TTL, mode = DE
   return messages === body.messages ? body : { ...body, messages }
 }
 
+/**
+ * CLI keeps the generic history anchors, with one extra case for transcript
+ * producers that send consecutive users as many text blocks. After merging,
+ * a tail-only marker misses when the old last two blocks change and a new one
+ * is appended. Mark N-3 now so the next turn can look back to that prefix.
+ * This is a cache hint; only the upstream can establish prefix equality.
+ * Keep at most two message markers, leaving system/tools slots to native CLI.
+ */
+export function applyCliMessageBreakpoints(body, ttl = DEFAULT_CACHE_TTL) {
+  const out = applyMessageBreakpoints(body, ttl, 'rewrite')
+  if (out?.messages?.length !== 1 || out.messages[0]?.role !== 'user') return out
+  const message = out.messages[0]
+  const blocks = message.content
+  if (!Array.isArray(blocks) || blocks.length < 4) return out
+  if (!blocks.every((block) => block?.type === 'text' && typeof block.text === 'string' && block.text.trim()))
+    return out
+  const index = blocks.length - 3
+  const content = blocks.slice()
+  content[index] = stampNode(blocks[index], normalizeCacheTtl(ttl))
+  return { ...out, messages: [{ ...message, content }] }
+}
+
 /** Bounded marker inventory for diagnostics. No prompt or image bytes. */
 export function listCacheMarkers(body) {
   const hits = []

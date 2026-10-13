@@ -267,14 +267,14 @@ test('allocations trimmed to 50 per account', () => {
   assert.equal(recent[4].util_5h, 0.59)
 })
 
-test('max_concurrency 0 blocks instead of treating as unlimited', () => {
+test('max_concurrency 0 removes the gateway concurrency cap', () => {
   const q = new AccountQuota({ dataDir: tmpDir(), config: { concurrency: { default_max_per_account: 20 } } })
   q.ensure({ account_id: 'zero', max_concurrency: 0 })
   q.setMaxConcurrency('zero', 0, { override: true })
   const gate = q.canAccept('zero')
-  assert.equal(gate.ok, false)
-  assert.equal(gate.reason, 'concurrency_limit')
-  assert.equal(gate.detail.max, 0)
+  assert.equal(gate.ok, true)
+  assert.equal(q.limitFor(q.repo.get('zero')), Number.MAX_SAFE_INTEGER)
+  assert.equal(q.tryAcquire('zero').ok, true)
 })
 
 test('rebindToVm moves the UUID row onto the new slot', () => {
@@ -864,6 +864,51 @@ test('429 unified exhausted marks headers rejected without inventing official 10
   assert.equal(acc.unified.headers['5h'].utilization, 0.84)
   assert.notEqual(acc.unified.official?.['5h']?.utilization, 1)
   assert.equal(q.canAccept('acc-429').ok, false)
+})
+
+test('a bare 429 preserves live account windows instead of inventing exhaustion', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestHeaders('acc-local-429', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.18',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-5h-reset': futureReset(4 * 3600_000),
+    'anthropic-ratelimit-unified-7d-utilization': '0.17',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+  })
+  const before = q.repo.get('acc-local-429').unified.headers
+  q.ingestHeaders('acc-local-429', {}, null, { status: 429, exhausted: false })
+  const acc = q.repo.get('acc-local-429')
+  assert.deepEqual(acc.unified.headers, before)
+  assert.equal(q.canAccept('acc-local-429').ok, true)
+})
+
+test('a model-window 429 does not exhaust the account 5h or 7d windows', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestHeaders('acc-model-429', { 'anthropic-ratelimit-unified-7d_oi-status': 'rejected' }, null, { status: 429 })
+  const acc = q.repo.get('acc-model-429')
+  assert.equal(acc.unified['7d_oi'].status, 'rejected')
+  assert.equal(acc.unified.headers['5h'], undefined)
+  assert.equal(acc.unified.headers['7d'], undefined)
+  assert.equal(acc.unified.headers.exhausted_at, undefined)
+  assert.equal(q.canAccept('acc-model-429').ok, true)
+})
+
+test('a confirmed rejected account header blocks without relying on HTTP 429', () => {
+  for (const window of ['5h', '7d']) {
+    const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+    const id = `confirmed-${window}`
+    q.ingestHeaders(
+      id,
+      {
+        [`anthropic-ratelimit-unified-${window}-status`]: 'rejected',
+        [`anthropic-ratelimit-unified-${window}-reset`]: futureReset(4 * 3600_000),
+      },
+      null,
+      { status: 502, exhausted: false },
+    )
+    assert.equal(q.repo.get(id).unified.headers[window].status, 'rejected')
+    assert.equal(q.canAccept(id).ok, false)
+  }
 })
 
 test('stuck 5h header with growing tokens does not lift official utilization', () => {

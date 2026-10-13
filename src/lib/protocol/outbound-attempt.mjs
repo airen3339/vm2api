@@ -40,7 +40,7 @@ import {
 } from '../identity/official-cc-system-2.1.241.mjs'
 import {
   applyCacheTtlToBody,
-  applyMessageBreakpoints,
+  applyCliMessageBreakpoints,
   DEFAULT_CACHE_TTL,
   enforceCacheTtlOrder,
   normalizeCacheTtl,
@@ -198,7 +198,7 @@ export function prepareCliHopBody(
   body = alignSamplingWithThinking(body)
   body = stripIllegalCacheControlFields(body)
   body = removeCacheControlFields(body)
-  body = applyMessageBreakpoints(body, normalizeCacheTtl(cacheTtl), 'rewrite')
+  body = applyCliMessageBreakpoints(body, normalizeCacheTtl(cacheTtl))
   return body
 }
 /** Only legacy Haiku rejects thinking; Haiku 5.5 supports adaptive thinking. */

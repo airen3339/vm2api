@@ -3,7 +3,13 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { parseCodexCredentialInput, upsertCodexAccount, readCodexAccounts } from '../../src/lib/vm/codex-slot.mjs'
+import {
+  parseCodexCredentialInput,
+  upsertCodexAccount,
+  readCodexAccounts,
+  summarizeCodexSlot,
+  writeCodexAccounts,
+} from '../../src/lib/vm/codex-slot.mjs'
 
 test('parseCodexCredentialInput accepts Codex CLI auth.json', () => {
   const parsed = parseCodexCredentialInput({
@@ -109,4 +115,25 @@ test('imported Codex account defaults to unlimited kernel concurrency', () => {
   assert.equal(parsed.ok, true)
   assert.equal(parsed.account.max_concurrency, 0)
   assert.equal(parsed.account.rpm, 0)
+})
+
+test('slot summary carries the RPM the kernel enforces across its accounts', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-rpm-'))
+  try {
+    writeCodexAccounts(root, 'vm-a', [{ id: 'a', access_token: 'at', rpm: 6 }])
+    assert.equal(summarizeCodexSlot(root, { id: 'vm-a' }).account_rpm, 6)
+    writeCodexAccounts(root, 'vm-a', [
+      { id: 'a', access_token: 'at', rpm: 6 },
+      { id: 'b', access_token: 'at', rpm: 4 },
+    ])
+    assert.equal(summarizeCodexSlot(root, { id: 'vm-a' }).account_rpm, 10)
+    // One account without a cap leaves the slot uncapped.
+    writeCodexAccounts(root, 'vm-a', [
+      { id: 'a', access_token: 'at', rpm: 6 },
+      { id: 'b', access_token: 'at', rpm: 0 },
+    ])
+    assert.equal(summarizeCodexSlot(root, { id: 'vm-a' }).account_rpm, null)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

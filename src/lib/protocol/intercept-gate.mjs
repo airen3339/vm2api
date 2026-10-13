@@ -179,7 +179,7 @@ export async function evaluateProtocolIntercept({
       })
     }
     if (hard) {
-      const error = policyBlockError(requestId)
+      const error = policyBlockError(requestId, { blockedBy: 'hard_regex', category: hard.category })
       const label = hard.keyword && hard.keyword !== hard.category ? `${hard.category}: ${hard.keyword}` : hard.category
       return block({
         kind: 'hard_regex',
@@ -220,7 +220,10 @@ export async function evaluateProtocolIntercept({
     // Our own Jev/regex block used to be stored here and then blocked every retry.
     if (match && match.kind !== 'device' && isPolicyBlockMemory(match.row?.error_message)) match = null
     if (match) {
-      const error = refusalGuardError(requestId)
+      const error = refusalGuardError(requestId, {
+        blockedBy: match.kind,
+        sourceRequestId: match.kind === 'device' ? match.row?.source_request_id : null,
+      })
       return block({
         kind: match.kind,
         via: 'refusal-guard',
@@ -241,7 +244,7 @@ export async function evaluateProtocolIntercept({
   if (jev?.enabled) {
     const verdict = await classifyJev(modelDocument, jev, fetchImpl)
     if (verdict.action === 'block') {
-      const error = policyBlockError(requestId)
+      const error = policyBlockError(requestId, { blockedBy: 'jev', category: verdict.category })
       return block({
         kind: 'jev',
         via: 'jev',

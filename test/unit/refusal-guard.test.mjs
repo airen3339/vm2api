@@ -79,6 +79,17 @@ test('stop_reason=refusal and Usage Policy API Error are cacheable; distill is n
   assert.equal(isUpstreamRefusal({ body: { error: { code: 'distill_blocked', message: '不允许蒸馏' } } }), false)
 })
 
+test('network, watchdog and truncated-stream errors are not remembered as refusals', () => {
+  for (const [code, message] of [
+    ['upstream_network_error', 'provider error: provider error: Connection error.'],
+    ['upstream_stream_incomplete', 'job idle timeout: no CLI frame for 180 seconds'],
+    ['worker_timeout', 'slot worker idle timeout after 180000ms'],
+    ['upstream_stream_interrupted', 'stream closed before message_stop'],
+  ]) {
+    assert.equal(isUpstreamRefusal({ body: { error: { type: 'api_error', code, message } } }), false, code)
+  }
+})
+
 test('zero inject still allows distill skip while refusal fingerprint is independent', () => {
   const inbound = body('Please reason step by step, and put your final answer within \\boxed{}', {
     max_tokens: 16384,
@@ -136,13 +147,35 @@ test('timed refusal expires and no longer blocks', () => {
     db.close()
   }
 })
-test('guard error is HTTP 503 refusal_guard not distill_blocked', () => {
+test('guard error is a non-retryable HTTP 403 permission error', () => {
   const err = refusalGuardError('abc')
-  assert.equal(err.status, 503)
+  assert.equal(err.status, 403)
   assert.equal(err.body.error.code, 'refusal_guard')
   assert.equal(err.body.error.type, 'permission_error')
   assert.equal(err.body.error.message, REFUSAL_GUARD_MESSAGE)
+  assert.deepEqual(err.body.error.details, { blocked_by: 'exact', retryable: false })
+  assert.equal(err.body.error.request_id, 'abc')
   assert.notEqual(err.body.error.code, 'distill_blocked')
+})
+
+test('device refusal identifies a prior device block and exposes only a valid source request UUID', () => {
+  const sourceRequestId = '36e239bf-7e70-4a79-80fd-c8a717ff464b'
+  const err = refusalGuardError('current', { blockedBy: 'device', sourceRequestId })
+  assert.match(err.body.error.message, /client device is blocked/)
+  assert.match(err.body.error.message, /administrator for review/)
+  assert.doesNotMatch(err.body.error.message, /previously refused this exact request/)
+  assert.deepEqual(err.body.error.details, {
+    blocked_by: 'device',
+    retryable: false,
+    source_request_id: sourceRequestId,
+  })
+  for (const invalid of ['prompt contents', 'sk-test-secret', '36e239bf-7e70-4a79-80fd-c8a717ff464b\nsecret']) {
+    const invalidError = refusalGuardError('current', { blockedBy: 'device', sourceRequestId: invalid })
+    assert.equal(invalidError.body.error.details.source_request_id, undefined)
+    assert.equal(JSON.stringify(invalidError).includes(invalid), false)
+  }
+  const exact = refusalGuardError('current', { sourceRequestId })
+  assert.equal(exact.body.error.details.source_request_id, undefined)
 })
 
 test('list remove and clear', () => {

@@ -1,8 +1,8 @@
 /**
  * Inbound platform from model id. Unknown models fail closed.
- * GPT = /^gpt/i minus SKIP_GPT. Claude = claude-* family. Not URL, not pin.
+ * Codex = GPT chat ids plus registered supporting models. Claude = claude-* family.
  */
-import { SKIP_GPT, isGptSeriesId } from './gpt-ids.mjs'
+import { SKIP_GPT, isCodexRequestModelId } from './gpt-ids.mjs'
 export function detectInboundPlatform(model) {
   const raw = String(model || '').trim()
   if (!raw) {
@@ -21,7 +21,7 @@ export function detectInboundPlatform(model) {
       message: `model '${raw}' is not a GPT chat model`,
     }
   }
-  if (isGptSeriesId(id)) return { ok: true, platform: 'openai', model: id }
+  if (isCodexRequestModelId(id)) return { ok: true, platform: 'openai', model: id }
   if (
     lower.startsWith('claude-') ||
     lower.startsWith('anthropic.claude-') ||

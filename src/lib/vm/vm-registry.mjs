@@ -106,6 +106,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     max_rpm_override: kind.kind === 'codex' ? openAIPolicy.rpm_override : vm.policy?.rpmOverride === true,
     max_sessions: kind.kind === 'codex' ? openAIPolicy.max_sessions : null,
     max_sessions_override: kind.kind === 'codex' ? openAIPolicy.sessions_override : false,
+    codex_account_rpm: kind.kind === 'codex' ? (codex?.account_rpm ?? null) : null,
     session_slots: kind.kind === 'codex' ? null : (vm.policy?.sessionSlots ?? null),
     session_slots_override: kind.kind === 'codex' ? false : vm.policy?.sessionSlotsOverride === true,
     scheduling_inherited:
@@ -161,6 +162,8 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
             restricted_until: quotaGate?.until || null,
           }
         : null,
+    codex_limited_until:
+      kind.kind === 'codex' ? vm.codex?.extra?.codex_limited_until || vm.codex_limited_until || null : null,
     reset_credits: codex?.reset_credits || null,
     plan_type: codex?.plan_type || null,
     claude_reset_credits: kind.kind === 'codex' ? null : vm.claude_reset_credits || null,

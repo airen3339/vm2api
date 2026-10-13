@@ -4,6 +4,7 @@
  */
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { isGptSeriesId, isSyncableGptCatalogId } from './gpt-ids.mjs'
+import { parseNativeCodexModelInfo } from './codex-models.mjs'
 
 const SETTINGS_KEY = 'gpt_model_policy'
 
@@ -28,6 +29,7 @@ function entry(id, extra = {}) {
     capabilities: extra.capabilities || { ...CAP_GPT },
     params: extra.params || { max_tokens_default: 16384, max_tokens_cap: 128000 },
     aliases: extra.aliases || [],
+    ...(extra.codex_model_info ? { codex_model_info: extra.codex_model_info } : {}),
   }
 }
 
@@ -153,6 +155,7 @@ export function syncGptIdsIntoPolicy(ids = []) {
     live.push({
       id,
       display_name: String((typeof item === 'object' && item?.display_name) || '').trim(),
+      ...(typeof item === 'object' && item?.codex_model_info ? { codex_model_info: item.codex_model_info } : {}),
     })
   }
   if (!live.length) {
@@ -164,6 +167,7 @@ export function syncGptIdsIntoPolicy(ids = []) {
     next[row.id] = entry(row.id, {
       ...prev,
       display_name: row.display_name || prev?.display_name || row.id,
+      codex_model_info: row.codex_model_info || prev?.codex_model_info,
       enabled: prev?.enabled !== false,
       source: 'codex',
     })
@@ -181,4 +185,13 @@ export function syncGptIdsIntoPolicy(ids = []) {
     synced: live.length,
     ids: listGptPolicyModels().map((m) => m.id),
   }
+}
+
+/** Return only complete upstream Codex ModelInfo rows for native clients. */
+export function listNativeCodexModelCatalog() {
+  if (!loaded) loadGptModelPolicy()
+  return Object.entries(policy.models || {})
+    .filter(([id, cfg]) => isGptSeriesId(id) && cfg?.enabled !== false && cfg?.codex_model_info)
+    .map(([id, cfg]) => parseNativeCodexModelInfo(cfg.codex_model_info, id, cfg.codex_model_info.display_name))
+    .filter(Boolean)
 }

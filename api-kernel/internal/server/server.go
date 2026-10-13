@@ -34,6 +34,10 @@ func (s *Server) authorize(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if token := strings.TrimSpace(s.Token); token != "" {
 			got := r.Header.Get("X-Kin-Internal-Token")
+			// Older running gateways still send the legacy internal header.
+			if got == "" {
+				got = r.Header.Get("X-Internal-Token")
+			}
 			if subtle.ConstantTimeCompare([]byte(token), []byte(got)) != 1 {
 				http.Error(w, `{"ok":false,"error":{"code":"internal_auth_failed"}}`, http.StatusUnauthorized)
 				return

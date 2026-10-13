@@ -43,3 +43,36 @@ func TestForwardCopiesUpstream(t *testing.T) {
 		t.Fatalf("body %s", rec.Body.String())
 	}
 }
+
+func TestInternalAuthentication(t *testing.T) {
+	cases := []struct {
+		name    string
+		current string
+		legacy  string
+		want    int
+	}{
+		{"current", "t", "", http.StatusOK},
+		{"legacy", "", "t", http.StatusOK},
+		{"missing", "", "", http.StatusUnauthorized},
+		{"wrong current", "wrong", "", http.StatusUnauthorized},
+		{"wrong legacy", "", "wrong", http.StatusUnauthorized},
+		{"invalid current wins", "wrong", "t", http.StatusUnauthorized},
+	}
+	h := (&Server{Token: "t", Pool: pool.NewManager()}).Handler()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/internal/health", nil)
+			if tc.current != "" {
+				req.Header.Set("X-Kin-Internal-Token", tc.current)
+			}
+			if tc.legacy != "" {
+				req.Header.Set("X-Internal-Token", tc.legacy)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status %d, want %d", rec.Code, tc.want)
+			}
+		})
+	}
+}

@@ -228,12 +228,14 @@ Claude `routing.quota` 的 5h/7d 闸分三段（`critical_band` 默认 0.05，`g
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET/PUT | `/refusal-guards` | 精确指纹，以及可选的用户正文近似（`similarity_enabled`，`similarity` 为 80/85/90/95，默认开、90）。命中 HTTP 503，`code=refusal_guard`，不 hop。相似度只比用户正文。`device_block_enabled` 默认开：命中后永久封禁入站 device id。响应带 `devices` |
+| GET/PUT | `/refusal-guards` | 精确指纹，以及可选的用户正文近似（`similarity_enabled`，`similarity` 为 80/85/90/95，默认开、90）。命中 HTTP 403 `permission_error`，`code=refusal_guard`，不 hop；`details.blocked_by` 区分 `exact` / `similar` / `device`，`details.retryable=false`，响应头 `x-should-retry: false`。相似度只比用户正文。`device_block_enabled` 默认开：命中后永久封禁入站 device id。响应带 `devices` |
 | DELETE | `/refusal-guards/:fingerprint` | 删除一条 64 位 hex 指纹 |
 | DELETE | `/refusal-guards` | 须 `{ "confirm": true }` 清空 |
 | DELETE | `/refusal-device-blocks` | `{ "device_id" }` 解封一条；`{ "confirm": true }` 清空。空 device、短于 8 字符的值不会入库 |
 
 `PUT { enabled }` 写入 SQLite `settings.refusal_guard_enabled`。环境变量 `REFUSAL_GUARD=0` 仍强制关闭。与蒸馏拦截独立：0 注入跳过普通蒸馏针，本缓存仍生效。`count_tokens` 同样在 peek / worker hop 之前拦截。device 取入站 `metadata.user_id.device_id`，否则显式 `device_id` / `x-kin-device-id`，不用 IP、UA 或 API key。仅 admin。
+
+设备级规则会拦截同一 device 后续的所有正文，包括不同请求。需要恢复该设备的正常请求时，可仅 `PUT { "device_block_enabled": false }`；已有 device 记录保留，精确及近似正文拦截继续按原设置执行。设备命中时 `details.source_request_id` 只返回合法的网关请求 UUID，不返回设备标识或原请求正文。
 
 ## 决策模型与硬正则
 
@@ -245,7 +247,7 @@ Claude `routing.quota` 的 5h/7d 闸分三段（`critical_band` 默认 0.05，`g
 
 三个后端走同一套 `/v1/systemone`。题库存在 `questions`：可增删改，缺省是内置六题（综合、色情、破限、逆向、渗透、网络攻击）。每题都是「是否安全」，高分表示安全，启用的题目一起问，任一题低于阈值就拦。`safety_instruction` 非空时再多问一题自定义要求。`POST /jev-intercept/models` 用地址和 Key（留空则用已存的第一把）请求 `{base}/v1/models`，失败回 502，不会把上游 401 当成面板登出。
 
-内置正则覆盖 NSFW、蒸馏、破解、破限，面板删不掉。比较的是用户自己写下的正文，不含 user 轮里的 `tool_result` / `*_tool_result` / `function_call_output`；决策模型仍看 system。命中硬正则或模型返回 HTTP 403 `policy_blocked`，不 hop；拒答守卫开启时写入拒答缓存，并在 device 封禁开启时封禁入站 device id。上游 `content_policy` / `content_filter` / `cyber_policy` / `moderation_blocked` / `safety_violation` / `usage_policy` 同样入库。仅 admin。
+内置正则覆盖 NSFW、蒸馏、破解、破限，面板删不掉。硬正则比较当前及历史的直接用户文本，排除 `tool_result`、工具输出和 assistant / system 内容；决策模型额外保留客户端 `system` / `instructions`，以维持上游安全检查。本地非蒸馏硬正则或决策模型命中返回 HTTP 400 `invalid_request_error` / `policy_blocked`，带 `details.blocked_by`、`details.retryable=false` 和 `x-should-retry: false`，避免客户端误提示 `/login`；不 hop，也不写入拒答缓存。设备封禁仍遵循独立的 `device_block_enabled` 设置。蒸馏类别沿用蒸馏关配置的状态（默认 403）。上游 `content_policy` / `content_filter` / `cyber_policy` / `moderation_blocked` / `safety_violation` / `usage_policy` 仍按拒答守卫设置入库。仅 admin。
 
 
 ## 密钥 / 日志

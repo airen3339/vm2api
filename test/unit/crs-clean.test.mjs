@@ -9,7 +9,10 @@ import {
   fromClaudeToResponses,
 } from '../../src/lib/protocol/convert.mjs'
 import { applyCrsIdentityReplace, uuidFromSeed } from '../../src/lib/identity/identity-rewrite.mjs'
-import { applyCrsUnofficialPersona, CRS_OFFICIAL_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
+import {
+  applyCrsUnofficialPersona as applyCrsUnofficialPersonaRaw,
+  CRS_OFFICIAL_SYSTEM,
+} from '../../src/lib/identity/crs-persona.mjs'
 import { hidePersonaUsage, personaHideInputTokens } from '../../src/lib/identity/crs-persona-usage.mjs'
 import {
   TEST14_FEATURES,
@@ -18,6 +21,15 @@ import {
   matchesTest14Features,
   officialSystemKinds,
 } from '../../src/lib/protocol/case-features.mjs'
+
+// These legacy assertions exercise the pre-template rewrite path explicitly;
+// the production default is covered separately by crs-persona.test.mjs.
+function applyCrsUnofficialPersona(body, options = {}) {
+  return applyCrsUnofficialPersonaRaw(body, {
+    ...options,
+    ...(options.mode == null && options.routingFile == null ? { mode: 'rewrite' } : {}),
+  })
+}
 
 test('sanitize keeps official context_management and maps stop → stop_sequences', () => {
   const out = sanitizeAnthropicBody({

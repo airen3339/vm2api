@@ -2,7 +2,7 @@ import { inferClaudeTier } from './claude-tier.mjs'
 import { isFableModel } from './upstream-error-policy.mjs'
 import { getModelEntry, getPolicyCatalogIds, resolvePolicyModelId } from '../protocol/model-policy.mjs'
 import { getGptPolicyCatalogIds } from '../protocol/gpt-model-policy.mjs'
-import { isCodexCatalogModel } from '../protocol/models.mjs'
+import { isCodexRequestModelId, isCodexSupportingModelId } from '../protocol/gpt-ids.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 
 export function normalizeAllowedModels(raw) {
@@ -33,6 +33,8 @@ function keysIntersect(left, right) {
   for (const a of left) {
     for (const b of right) {
       if (a === b) return true
+      // Supporting models have exact IDs; GPT/Claude prefixes must not grant them.
+      if (isCodexSupportingModelId(a) || isCodexSupportingModelId(b)) continue
       // The corrected 5-1 id must not widen a Fable 5 allowlist (or vice versa).
       const fable51 = /^claude-fable-5(?:-1|\.1)(?:-|$)/
       if (fable51.test(a) !== fable51.test(b)) continue
@@ -70,7 +72,7 @@ export function parseAllowedModelsPatch(raw, opts = {}) {
     const value = String(item || '').trim()
     if (!value) continue
     if (gpt) {
-      const known = catalog.has(value.toLowerCase())
+      const known = catalog.has(value.toLowerCase()) || isCodexSupportingModelId(value)
       if (!known) return { ok: false, error: `unknown model: ${value}` }
       ids.push(value)
       continue
@@ -130,8 +132,8 @@ export function slotAllowsModel({ vm, account = null, model } = {}) {
   const modelKey = String(model || '').trim()
   if (!modelKey) return { ok: true }
   if (isCodexVm(vm)) {
-    if (!isCodexCatalogModel(modelKey)) return { ok: false, reason: 'codex_model_required' }
-  } else if (isCodexCatalogModel(modelKey)) {
+    if (!isCodexRequestModelId(modelKey)) return { ok: false, reason: 'codex_model_required' }
+  } else if (isCodexRequestModelId(modelKey)) {
     return { ok: false, reason: 'claude_model_required' }
   }
   const canonical = resolvePolicyModelId(modelKey) || modelKey

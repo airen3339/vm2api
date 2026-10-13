@@ -157,6 +157,9 @@ export function formatPoolSelectionSummary(details = {}) {
   }
   const eligible = Number(details.eligible)
   if (Number.isFinite(eligible)) parts.push(`eligible=${eligible}`)
+  if (eligible === 0 && Array.isArray(details.rejected) && details.rejected.length) {
+    parts.push(`rejected=${details.rejected.map((item) => `${item.vm_id}:${item.reason}`).join(',')}`)
+  }
   if (details.sticky_cleared) parts.push('sticky_cleared')
   return parts.join(' ')
 }
@@ -186,7 +189,10 @@ function scopedSeatKey(seatKey, scope = PLATFORM_SCOPE) {
  * either, nothing will come back by waiting (503).
  */
 function emptyPoolFailure(model, candidates, now = Date.now()) {
-  if (isFableModel(model)) return { reason: 'fable_requires_max', retry_after_ms: null }
+  const rejected = Array.isArray(candidates?.rejected) ? candidates.rejected : []
+  if (isFableModel(model) && rejected.length > 0 && rejected.every((item) => item?.reason === 'fable_requires_max')) {
+    return { reason: 'fable_requires_max', retry_after_ms: null }
+  }
   if ((candidates?.rejections?.quota_guard_request_too_large || 0) > 0) {
     return { reason: 'quota_guard_request_too_large', retry_after_ms: null }
   }
@@ -211,6 +217,7 @@ function selectionSnapshot(candidates = [], available = [], extras = {}) {
     wait_reasons: waitReasons,
     eligible: (candidates || []).length,
     available: (available || []).length,
+    rejected: Array.isArray(candidates?.rejected) ? candidates.rejected : [],
     sticky_cleared: !!extras.stickyCleared,
   }
 }
@@ -227,7 +234,7 @@ function parseConcurrency(value, fallback) {
   if (value == null || value === '') return fallback
   const n = Number(value)
   if (!Number.isFinite(n)) return fallback
-  return Math.max(0, n)
+  return n === 0 ? Number.MAX_SAFE_INTEGER : Math.max(0, n)
 }
 
 function maxConcurrencyOf(vm, fallback = 2) {
@@ -870,6 +877,9 @@ export class PoolScheduler extends EventEmitter {
     // that cause (pool_rate_limited / pool_overload_cooldown) instead of 503.
     candidates.cooldowns = { rate_limited: null, overloaded: null }
     candidates.rejections = { quota_guard_request_too_large: 0 }
+    // Why each slot was left out; an empty pool reports this instead of a bare count.
+    const rejected = []
+    candidates.rejected = rejected
     const pin = pinVmId ? String(pinVmId).trim() : ''
     for (const summary of summaries) {
       if (signal?.aborted) throw makeAbortError()
@@ -901,6 +911,7 @@ export class PoolScheduler extends EventEmitter {
         } else if (kind === 'quota_guard_request_too_large') {
           candidates.rejections.quota_guard_request_too_large += 1
         }
+        rejected.push({ vm_id: vm.id, reason: eligibility.reason || 'ineligible' })
         continue
       }
       const maxConcurrency = this.effectiveMaxConcurrency(
@@ -943,11 +954,16 @@ export class PoolScheduler extends EventEmitter {
     // sub2api IsSchedulable: rate_limit_reset_at / overload_until gate before any
     // passive Extra reading or health hop. Pins are diagnostics and still reach the slot.
     const hardBlock = pinned ? null : hardBlockOf(state, now)
-    if (hardBlock) return { ok: false, reason: hardBlock.reason, until: hardBlock.until }
+    // Provider 529 is temporary capacity: retain the valid slot in the wait
+    // pool so a sole account reports pool_overloaded with its recovery time.
+    // Quota/auth blocks remain hard exclusions.
+    const overloadUntil = hardBlock?.reason === 'overloaded' ? hardBlock.until : null
+    if (hardBlock && !overloadUntil) return { ok: false, reason: hardBlock.reason, until: hardBlock.until }
     let circuitProbeUntil = null
+    let circuitOpenUntil = null
     if (!pinned) {
       const circuit = this.unitCircuit?.inspect?.(accountId, now)
-      if (circuit?.reason === 'circuit_open') return { ok: false, reason: circuit.reason, until: circuit.until }
+      if (circuit?.reason === 'circuit_open') circuitOpenUntil = circuit.until
       if (circuit?.reason === 'circuit_probe') circuitProbeUntil = circuit.until
     }
     const gate = evaluateSlotGate(vm)
@@ -1075,8 +1091,9 @@ export class PoolScheduler extends EventEmitter {
       busy = true
       waitReason = waitReason || reason
       const next = Number(until) || 0
-      if (next > now) availableAt = availableAt ? Math.min(availableAt, next) : next
+      if (next > now) availableAt = availableAt ? Math.max(availableAt, next) : next
     }
+    if (overloadUntil) markWait('account_cooldown', overloadUntil)
     if (state && cooldownActive(state.cooldown_until, now) && !leftoverNoRefreshPark) {
       markWait('account_cooldown', state.cooldown_until)
     }
@@ -1100,6 +1117,7 @@ export class PoolScheduler extends EventEmitter {
       }
     }
     const inflight = this.inflight.get(accountId) || 0
+    if (circuitOpenUntil) markWait('circuit_probe', circuitOpenUntil)
     if (circuitProbeUntil) markWait('circuit_probe', circuitProbeUntil)
     if (inflight >= maxConcurrency) markWait('concurrency_limit')
     const fableCap = Number(this.config.fable_max_per_account)
@@ -1337,7 +1355,12 @@ export class PoolScheduler extends EventEmitter {
     const candidates = await this.eligibleCandidates({ model, signal, ownerScope, keyScope })
     if (!candidates.length) {
       const empty = emptyPoolFailure(model, candidates)
-      return { ok: false, code: empty.reason, retry_after_ms: empty.retry_after_ms }
+      return {
+        ok: false,
+        code: empty.reason,
+        retry_after_ms: empty.retry_after_ms,
+        rejected: candidates.rejected || [],
+      }
     }
     const bound = stickyKey ? this.stickyRouter?.resolve?.(stickyKey) : null
     if (bound) {

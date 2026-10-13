@@ -91,6 +91,15 @@ export function createKernelWatchdog({
   let timer = null
   let running = false
   let inTick = false
+  const pending = new Set()
+  const track = (task) => {
+    pending.add(task)
+    task.then(
+      () => pending.delete(task),
+      () => pending.delete(task),
+    )
+    return task
+  }
   // vmId -> { attempts: [ms], nextAt }
   const restarts = new Map()
   // vmId -> next ms a telemetry sidecar check is due
@@ -137,7 +146,7 @@ export function createKernelWatchdog({
     return true
   }
 
-  async function tick() {
+  async function runTick() {
     if (inTick || !config.enabled) return
     inTick = true
     try {
@@ -149,7 +158,7 @@ export function createKernelWatchdog({
         // missing sidecar costs telemetry, not inference. Off the tick's critical
         // path so a slow docker exec cannot delay container restarts. The due time
         // is set before the check runs, so a slot never has two checks in flight.
-        if (isTelemetryHealTarget(vm)) void healTelemetry(vm, now())
+        if (isTelemetryHealTarget(vm)) track(healTelemetry(vm, now()))
         if (!isKernelWatchdogTarget(vm, routing)) continue
         const exec = {
           vmId: vm.id,
@@ -177,6 +186,8 @@ export function createKernelWatchdog({
     }
   }
 
+  const tick = () => track(runTick())
+
   return {
     setConfig(next) {
       config = normalizeKernelWatchdogConfig(next || {})
@@ -194,5 +205,8 @@ export function createKernelWatchdog({
       timer = null
     },
     tick,
+    whenIdle: async () => {
+      while (pending.size) await Promise.allSettled([...pending])
+    },
   }
 }

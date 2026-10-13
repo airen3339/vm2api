@@ -76,7 +76,13 @@ test('API backend applies the global official_full persona setting', async () =>
       return body
     },
     writeSSEHeaders() {},
-    readBody: async () => ({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hello' }] }),
+    readBody: async () => ({
+      model: 'claude-opus-5-5',
+      messages: [{ role: 'user', content: 'hello' }],
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'low' },
+      context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+    }),
     requireAuth: () => true,
     cfg: {
       rewrite: { enabled: false },
@@ -93,7 +99,7 @@ test('API backend applies the global official_full persona setting', async () =>
       pick: () => ({
         ok: true,
         endpoint: { id: 'ep-test', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
-        upstream_model: 'claude-haiku-4-5',
+        upstream_model: 'claude-opus-5-5',
         key: { id: 'key-test', api_key: 'secret' },
       }),
     },
@@ -113,7 +119,12 @@ test('API backend applies the global official_full persona setting', async () =>
   const req = {
     method: 'POST',
     url: '/v1/messages',
-    headers: { authorization: 'Bearer master', 'x-kin-backend': 'api', 'user-agent': 'test-client' },
+    headers: {
+      authorization: 'Bearer master',
+      'x-kin-backend': 'api',
+      'user-agent': 'test-client',
+      'anthropic-beta': 'oauth-2025-04-20,context-management-2025-06-27,effort-2025-11-24',
+    },
     apiKeyKind: 'master',
     once() {},
     off() {},
@@ -125,6 +136,13 @@ test('API backend applies the global official_full persona setting', async () =>
     const outbound = JSON.parse(received.body)
     assert.equal(outbound.system.length, 4)
     assert.equal(outbound.system[2].text, `${DEFAULT_AGENT_STANDING}\n${CRS_OFFICIAL_AGENT_PROMPT}`)
+    assert.deepEqual(outbound.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
+    const betas = String(received.headers['anthropic-beta'] || '').split(',')
+    assert.ok(betas.includes('context-management-2025-06-27'))
+    assert.ok(betas.includes('effort-2025-11-24'))
+    assert.ok(betas.includes('per-turn-control-2026-07-01'))
+    assert.ok(!betas.includes('oauth-2025-04-20'))
+    assert.deepEqual(outbound.context_management, { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] })
   } finally {
     await new Promise((resolve) => kernel.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })

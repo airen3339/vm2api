@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   pickCodexSlots,
   orderCodexSessionSlots,
+  codexAccountCandidate,
   isCodexSlotParked,
   isCodexFailoverError,
   evaluateCodexQuotaSchedule,
@@ -29,6 +30,45 @@ test('ready slots sort by remaining 5h/7d stress', () => {
   ])
   assert.deepEqual(picked.ids, ['vm-a', 'vm-b'])
   assert.equal(picked.error, undefined)
+})
+
+test('explicit zero Codex concurrency has no gateway cap while missing values keep defaults', () => {
+  const unlimited = codexAccountCandidate(
+    gpt('vm-a', { max_concurrency: 0, max_rpm: 0, concurrencyOverride: true }),
+    Date.now(),
+    {
+      inFlight: 1000,
+      rpmCount: 1000,
+    },
+  )
+  assert.equal(unlimited.concurrency, Number.MAX_SAFE_INTEGER)
+  assert.equal(unlimited.maxRpm, 0)
+  assert.equal(codexAccountCandidate(gpt('vm-b')).concurrency, 2)
+})
+
+test('uncommitted Codex SSE termination fails over before exposing a broken stream', () => {
+  const fail = (status, committed, code) => ({ ok: false, status, committed, body: { error: { code } } })
+  assert.equal(isCodexFailoverError(fail(200, false, 'codex_upstream')), true)
+  assert.equal(isCodexFailoverError(fail(502, false, 'server_is_overloaded')), true)
+  assert.equal(isCodexFailoverError(fail(200, true, 'codex_upstream')), false)
+})
+
+test('only a precommit 5xx server_error adds a Codex account failover', () => {
+  const fail = (status, code, committed = false) => ({ ok: false, status, committed, body: { error: { code } } })
+  for (const status of [500, 502, 503, 504, 599]) {
+    assert.equal(isCodexFailoverError(fail(status, 'server_error')), true)
+    assert.equal(isCodexFailoverError(fail(status, 'server_error', true)), false)
+  }
+  for (const status of [200, 400, 600]) assert.equal(isCodexFailoverError(fail(status, 'server_error')), false)
+  for (const code of [
+    'context_length_exceeded',
+    'invalid_request_error',
+    'content_policy_violation',
+    'internal_server_error',
+  ]) {
+    assert.equal(isCodexFailoverError(fail(502, code)), false)
+  }
+  assert.equal(isCodexFailoverError({ ...fail(502, 'server_error'), ok: true }), false)
 })
 
 test('parked slots come after ready ones', () => {
@@ -264,4 +304,31 @@ test('RPM-only capacity miss reports when the window reopens', async () => {
   assert.equal(full.error, 'capacity_unavailable')
   assert.equal(full.retryAt, now + 60_000)
   resetOpenAIAccountRuntime()
+})
+
+test('the kernel account rpm caps admission alongside the panel max_rpm', () => {
+  const signals = { inFlight: 0, rpmCount: 0 }
+  assert.equal(codexAccountCandidate(gpt('vm-a', { max_rpm: 0, codex_account_rpm: 3 }), Date.now(), signals).maxRpm, 3)
+  assert.equal(codexAccountCandidate(gpt('vm-a', { max_rpm: 2, codex_account_rpm: 3 }), Date.now(), signals).maxRpm, 2)
+  assert.equal(codexAccountCandidate(gpt('vm-a', { max_rpm: 10, codex_account_rpm: 3 }), Date.now(), signals).maxRpm, 3)
+  assert.equal(codexAccountCandidate(gpt('vm-a', { max_rpm: 0 }), Date.now(), signals).maxRpm, 0)
+})
+
+test('a slot held after kernel no_capacity is skipped until its hold ends', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const now = Date.now()
+  const until = rt.markOpenAISlotBusy('vm-a', { now })
+  assert.equal(until, now + 2000)
+  assert.equal(rt.tryAcquireOpenAISlot('vm-a', { now: now + 100 }), null)
+  const held = orderCodexSessionSlots([gpt('vm-a')], { now: now + 100 })
+  assert.equal(held.error, 'capacity_unavailable')
+  assert.equal(held.retryAt, until)
+  // Another slot still takes the request.
+  assert.deepEqual(orderCodexSessionSlots([gpt('vm-a'), gpt('vm-b')], { now: now + 100 }).ids, ['vm-b'])
+  // A second refusal in a row doubles the hold; a success clears it.
+  assert.equal(rt.markOpenAISlotBusy('vm-a', { now: now + 100 }), now + 4100)
+  rt.reportOpenAIAttempt('vm-a', 'succeeded')
+  assert.ok(rt.tryAcquireOpenAISlot('vm-a', { now: now + 200 }))
+  rt.resetOpenAIAccountRuntime()
 })

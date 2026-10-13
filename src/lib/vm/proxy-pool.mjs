@@ -322,6 +322,7 @@ export class ProxyPool extends EventEmitter {
     this.state = { config: { ...DEFAULT_CONFIG }, proxies: [] }
     this._timer = null
     this._probing = false
+    this._probeTasks = new Set()
     this._probeSockets = new Map()
     // Node exits are not pool rows: px-local's geo is the control plane's, a node slot leaves elsewhere.
     this._exitGeo = new Map()
@@ -907,7 +908,7 @@ export class ProxyPool extends EventEmitter {
    * TCP connect probe to host:port (SOCKS5 handshake optional lightweight).
    * Full SOCKS5 auth handshake is best-effort.
    */
-  async probeOne(proxy) {
+  async probeOne(proxy, { repairEgress = false } = {}) {
     const blocked = proxyBlockedReason(proxy, this.state.config.ipv6_enabled)
     if (blocked) return { ok: false, scope: 'policy', error: blocked, latency_ms: null }
     if (isLocalEgressProxy(proxy)) {
@@ -919,13 +920,14 @@ export class ProxyPool extends EventEmitter {
     if (!socks.ok) return { ...socks, scope: 'socks' }
     if (typeof this.egressCheck !== 'function') return { ...socks, scope: 'socks' }
     let eg = this.egressCheck(proxy)
-    if (!eg?.ok && typeof this.repairEgress === 'function') {
+    if ((repairEgress || !eg?.ok) && typeof this.repairEgress === 'function') {
+      let repaired
       try {
-        this.repairEgress(proxy)
+        repaired = this.repairEgress(proxy)
       } catch {
-        /* keep egress failure */
+        repaired = { ok: false }
       }
-      eg = this.egressCheck(proxy)
+      eg = repaired?.ok === false ? { ok: false, reason: 'egress_repair_failed' } : this.egressCheck(proxy)
     }
     if (eg?.ok) return { ...socks, scope: 'socks' }
     return {
@@ -1008,7 +1010,21 @@ export class ProxyPool extends EventEmitter {
     return { ok: true, proxy: this.publicProxy(p), probe: result }
   }
 
-  async probeAll({ onlyEnabled = true } = {}) {
+  async whenIdle() {
+    while (this._probeTasks.size) await Promise.allSettled([...this._probeTasks])
+  }
+
+  probeAll(options = {}) {
+    const task = this._runProbeAll(options)
+    this._probeTasks.add(task)
+    task.then(
+      () => this._probeTasks.delete(task),
+      () => this._probeTasks.delete(task),
+    )
+    return task
+  }
+
+  async _runProbeAll({ onlyEnabled = true, repairEgress = false } = {}) {
     if (this._probing) return { ok: false, error: 'probe_in_progress' }
     this._probing = true
     const results = []
@@ -1020,7 +1036,7 @@ export class ProxyPool extends EventEmitter {
         return p.status === 'fail' || (p.status === 'dead' && p.last_error)
       })
       for (const p of list) {
-        const result = await this.probeOne(p)
+        const result = await this.probeOne(p, { repairEgress })
         this._applyProbeResult(p, result)
         results.push({ id: p.id, ...result, status: p.status, enabled: p.enabled })
       }
@@ -1210,7 +1226,8 @@ export class ProxyPool extends EventEmitter {
     if (!this.state.config.enabled) return
     const min = this.state.config.probe_interval_min || 10
     const ms = min * 60 * 1000
-    void this.probeAll({ onlyEnabled: true }).catch(() => {})
+    // Listeners can survive while transparent DNS/REDIRECT rules are lost.
+    void this.probeAll({ onlyEnabled: true, repairEgress: true }).catch(() => {})
     this._timer = setInterval(() => {
       this.probeAll({ onlyEnabled: true }).catch(() => {})
     }, ms)

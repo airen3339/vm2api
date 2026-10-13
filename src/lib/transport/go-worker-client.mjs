@@ -2,6 +2,7 @@ import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
@@ -32,6 +33,13 @@ import { extraHeadersFromLimitError, isPlanLimitMessage } from '../pool/quota-wi
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
+
+/** Wait for already admitted refreshes without initiating a new OAuth hop. */
+export async function waitExistingCredentialRefreshes() {
+  while (credentialRefreshTail.size) {
+    await Promise.allSettled([...credentialRefreshTail.values()])
+  }
+}
 
 function withCredentialRefreshLock(key, fn) {
   const prev = credentialRefreshTail.get(key) || Promise.resolve()
@@ -601,6 +609,9 @@ export async function streamGoWorker({
   deliveryMode = 'realtime',
   onEvent,
   onCommit,
+  onProtocolEvent,
+  isCompleteStream,
+  shouldCommitEvent,
   want1m = false,
   cacheTtl = null,
   preserveCacheBreakpoints = null,
@@ -772,7 +783,32 @@ export async function streamGoWorker({
       if (event.message?.model) sseModel = event.message.model
       const stop = event.message?.stop_reason || event.delta?.stop_reason
       if (stop) sseStop = stop
+      if (typeof onProtocolEvent === 'function') onProtocolEvent(event)
       return event
+    }
+    const commitEvent = typeof shouldCommitEvent === 'function' ? shouldCommitEvent : isDownstreamCommitEvent
+    const processLine = async (line) => {
+      applyClaudeSSELineToMessage(line, assembler)
+      if (line.startsWith('data:')) {
+        const piece = line.slice(5).trim()
+        if (piece && piece !== '[DONE]') {
+          dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
+          const event = observeSseEvent(takeSseEvent())
+          if (event && commitEvent(event)) await flushCommit()
+        }
+      } else if (line === '') {
+        if (dataBuf) {
+          const event = takeSseEvent()
+          dataBuf = ''
+          observeSseEvent(event)
+          if (event && commitEvent(event)) await flushCommit()
+        }
+      } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
+        dataBuf = `${dataBuf}\n${line}`
+        const event = observeSseEvent(takeSseEvent())
+        if (event && commitEvent(event)) await flushCommit()
+      }
+      await emitLine(line)
     }
     const firstByteMs = Math.max(0, Number(timeoutMs) || 0)
     const idleMs = Math.max(0, Number(idleTimeoutMs) || 0)
@@ -796,50 +832,34 @@ export async function streamGoWorker({
       // message_stop is the protocol terminal event, but the kernel still sends
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
+      const decoder = new StringDecoder('utf8')
       for await (const chunk of response) {
         sawChunk = true
         lastChunkAt = Date.now()
-        buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+        buffer += Buffer.isBuffer(chunk) ? decoder.write(chunk) : String(chunk)
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, newline).replace(/\r$/, '')
           buffer = buffer.slice(newline + 1)
-          applyClaudeSSELineToMessage(line, assembler)
-          if (line.startsWith('data:')) {
-            const piece = line.slice(5).trim()
-            if (piece && piece !== '[DONE]') {
-              dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
-              const event = observeSseEvent(takeSseEvent())
-              if (isDownstreamCommitEvent(event)) await flushCommit()
-            }
-          } else if (line === '') {
-            if (dataBuf) {
-              const event = takeSseEvent()
-              dataBuf = ''
-              observeSseEvent(event)
-              if (isDownstreamCommitEvent(event)) await flushCommit()
-            }
-          } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
-            dataBuf = `${dataBuf}\n${line}`
-            const event = observeSseEvent(takeSseEvent())
-            if (isDownstreamCommitEvent(event)) await flushCommit()
-          }
-          await emitLine(line)
+          await processLine(line)
         }
       }
+      buffer += decoder.end()
       if (buffer) {
-        applyClaudeSSELineToMessage(buffer, assembler)
-        await emitLine(buffer)
+        await processLine(buffer.replace(/\r$/, ''))
       }
       if (dataBuf) {
         const event = observeSseEvent(takeSseEvent())
-        if (isDownstreamCommitEvent(event)) await flushCommit()
+        if (event && commitEvent(event)) await flushCommit()
       }
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
       const assembled = assembler.message
       const stopReason = meta.stopReason || sseStop || assembled?.stop_reason || null
-      const complete = !lastError && isCompleteAssistantMessage({ body: assembled, stopReason, sawMessageStop })
+      const context = { body: assembled, stopReason, sawMessageStop }
+      const complete =
+        !lastError &&
+        (typeof isCompleteStream === 'function' ? isCompleteStream(context) : isCompleteAssistantMessage(context))
       if (!committed && complete) await flushCommit()
       const terminalState = complete ? 'verified' : 'incomplete'
       const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })

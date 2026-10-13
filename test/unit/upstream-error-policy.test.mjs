@@ -566,6 +566,42 @@ test('Usage Policy API Error stops the request and is cached with no expiry', ()
   }
 })
 
+test('CLI-wrapped request refusal stops the request without pausing the account', () => {
+  const policy = classifyUpstreamResult({
+    ok: false,
+    status: 502,
+    terminalState: 'incomplete',
+    body: {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message:
+          'provider error: provider error: API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup)',
+      },
+    },
+  })
+  assert.equal(policy.scope, 'request')
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.reason, 'usage_policy_refusal')
+  assert.equal(policy.rememberRefusal, true)
+  assert.equal(policy.refusalTtlMs, 0)
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(shouldContinue(policy), false)
+})
+
+test('ambiguous provider usage-policy error remains request-scoped', () => {
+  const now = Date.now()
+  const policy = classifyUpstreamResult(
+    { status: 502, body: { error: { message: 'Provider access paused due to Usage Policy' } } },
+    { now },
+  )
+  assert.equal(policy.scope, 'request')
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.reason, 'usage_policy_refusal')
+  assert.equal(policy.cooldownUntil, null)
+})
+
 test('assistant prefill 400 is repairable', () => {
   const policy = classifyUpstreamResult({
     status: 400,

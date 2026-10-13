@@ -25,6 +25,7 @@ export function readCodexAccounts(projectRoot, vmId) {
 
 export function writeCodexAccounts(projectRoot, vmId, accounts) {
   if (!projectRoot || !vmId) throw new Error('projectRoot and vmId required')
+  fs.mkdirSync(path.join(projectRoot, 'vms', vmId), { recursive: true, mode: 0o700 })
   atomicWriteJson(
     codexCredentialPath(projectRoot, vmId),
     { accounts: Array.isArray(accounts) ? accounts : [] },
@@ -296,6 +297,9 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
   const usage = buildCodexUsageView(Object.keys(extra).length ? extraToCodexSnapshot(extra) : vm.codex?.usage || {})
   const hasAccess = !!(first.access_token || vm.codex?.has_access)
   const hasRefresh = !!(first.refresh_token || vm.codex?.has_refresh)
+  // The kernel spreads requests over every account and enforces each one's RPM itself.
+  const rpms = accounts.map((account) => Number(account?.rpm))
+  const accountRpm = rpms.length && rpms.every((n) => n > 0) ? rpms.reduce((sum, n) => sum + n, 0) : null
   return {
     platform: 'openai',
     family: 'codex',
@@ -305,6 +309,7 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
     expires_at: first.expires_at || vm.codex?.expires_at || null,
     chatgpt_account_id: first.chatgpt_account_id || vm.codex?.chatgpt_account_id || null,
     account_count: accounts.length,
+    account_rpm: accountRpm,
     usage,
     reset_credits: vm.codex?.reset_credits || null,
     plan_type: vm.codex?.plan_type || null,

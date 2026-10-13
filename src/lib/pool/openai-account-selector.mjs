@@ -66,6 +66,8 @@ export function schedulingBlocker(candidate, context = {}) {
   }
   const excluded = context.excludedAccountIds
   if (excluded && excluded.has(candidate.id)) return 'excluded'
+  const busyUntil = Number(candidate.busyUntil)
+  if (busyUntil > (Number(context.now) || Date.now())) return 'upstream_busy'
   const cap = effectiveConcurrency(candidate, context.maxConcurrent)
   if (Number(candidate.inFlight || 0) >= cap) return 'concurrency_limit'
   const maxRpm = Number(candidate.maxRpm) || 0

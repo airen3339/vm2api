@@ -98,6 +98,7 @@ export function createCredentialRefreshMonitor(opts = {}) {
   let timer = null
   let inflight = null
   let lastRun = null
+  let scheduleGeneration = 0
   const nowFn = opts.now || (() => Date.now())
 
   const listDue = () => {
@@ -146,6 +147,7 @@ export function createCredentialRefreshMonitor(opts = {}) {
   }
 
   const stop = () => {
+    scheduleGeneration += 1
     if (timer) {
       clearInterval(timer)
       timer = null
@@ -155,12 +157,15 @@ export function createCredentialRefreshMonitor(opts = {}) {
   const start = ({ immediate = false } = {}) => {
     stop()
     if (!config.enabled) return { started: false, reason: 'disabled' }
+    const generation = scheduleGeneration
     timer = setInterval(() => {
+      if (generation !== scheduleGeneration) return
       runOnce().catch(() => {})
     }, config.interval_sec * 1000)
     if (typeof timer.unref === 'function') timer.unref()
     if (immediate && config.run_on_start) {
       queueMicrotask(() => {
+        if (generation !== scheduleGeneration) return
         runOnce().catch(() => {})
       })
     }
@@ -178,6 +183,9 @@ export function createCredentialRefreshMonitor(opts = {}) {
     setConfig,
     getSnapshot: () => lastRun,
     runOnce,
+    whenIdle: async () => {
+      while (inflight) await Promise.allSettled([inflight])
+    },
     start,
     stop,
   }

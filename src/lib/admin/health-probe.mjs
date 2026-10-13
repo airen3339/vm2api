@@ -607,6 +607,7 @@ export function createHealthProbeMonitor(opts = {}) {
   let lastRunAt = 0
   let inflight = null
   let timer = null
+  let scheduleGeneration = 0
   const nowFn = opts.now || (() => Date.now())
 
   const getConfig = () => config
@@ -722,6 +723,7 @@ export function createHealthProbeMonitor(opts = {}) {
   }
 
   const stop = () => {
+    scheduleGeneration += 1
     if (timer) {
       clearInterval(timer)
       timer = null
@@ -731,12 +733,15 @@ export function createHealthProbeMonitor(opts = {}) {
   const start = ({ immediate = false } = {}) => {
     stop()
     if (!config.enabled) return { started: false, reason: 'disabled' }
+    const generation = scheduleGeneration
     timer = setInterval(() => {
+      if (generation !== scheduleGeneration) return
       runRealProbe().catch(() => {})
     }, config.interval_sec * 1000)
     if (typeof timer.unref === 'function') timer.unref()
     if (immediate && config.run_on_start) {
       queueMicrotask(() => {
+        if (generation !== scheduleGeneration) return
         runRealProbe().catch(() => {})
       })
     }
@@ -757,6 +762,9 @@ export function createHealthProbeMonitor(opts = {}) {
     rawSnapshot: (platform = 'anthropic') => snapshots[platform] || null,
     decide,
     runRealProbe,
+    whenIdle: async () => {
+      while (inflight) await Promise.allSettled([inflight])
+    },
     start,
     stop,
   }

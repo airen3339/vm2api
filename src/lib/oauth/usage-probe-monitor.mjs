@@ -166,9 +166,12 @@ export function createUsageProbeMonitor(opts = {}) {
   let timer = null
   let inflight = null
   let lastRun = null
+  let scheduleGeneration = 0
   const nowFn = opts.now || (() => Date.now())
   // One /usage hop per VM at a time, shared by the timer and 429 events.
   const probing = new Map()
+  // A probe timeout does not cancel its worker/OAuth operation.
+  const activeProbes = new Set()
   const backoff = new Map()
   const queue = []
   let running = 0
@@ -209,7 +212,13 @@ export function createUsageProbeMonitor(opts = {}) {
     const run = worker
       .then(async () => {
         try {
-          const result = await withTimeout(Promise.resolve(opts.probeOne(vm)), config.timeout_ms)
+          const operation = Promise.resolve().then(() => opts.probeOne(vm))
+          activeProbes.add(operation)
+          operation.then(
+            () => activeProbes.delete(operation),
+            () => activeProbes.delete(operation),
+          )
+          const result = await withTimeout(operation, config.timeout_ms)
           const ok = result?.ok !== false
           if (ok) backoff.delete(id)
           else {
@@ -292,6 +301,7 @@ export function createUsageProbeMonitor(opts = {}) {
   }
 
   const stop = () => {
+    scheduleGeneration += 1
     if (timer) {
       clearInterval(timer)
       timer = null
@@ -301,12 +311,15 @@ export function createUsageProbeMonitor(opts = {}) {
   const start = ({ immediate = false } = {}) => {
     stop()
     if (!config.enabled) return { started: false, reason: 'disabled' }
+    const generation = scheduleGeneration
     timer = setInterval(() => {
+      if (generation !== scheduleGeneration) return
       runOnce().catch(() => {})
     }, config.interval_sec * 1000)
     if (typeof timer.unref === 'function') timer.unref()
     if (immediate && config.run_on_start) {
       queueMicrotask(() => {
+        if (generation !== scheduleGeneration) return
         runOnce().catch(() => {})
       })
     }
@@ -325,6 +338,11 @@ export function createUsageProbeMonitor(opts = {}) {
     getSnapshot: () => lastRun,
     runOnce,
     probeNow,
+    whenIdle: async () => {
+      while (inflight || probing.size || activeProbes.size) {
+        await Promise.allSettled([...(inflight ? [inflight] : []), ...probing.values(), ...activeProbes])
+      }
+    },
     start,
     stop,
   }

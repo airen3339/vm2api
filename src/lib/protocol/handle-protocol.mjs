@@ -211,8 +211,22 @@ export function createHandleProtocol(deps) {
       result?.body,
     )
     const summary = formatPoolSelectionSummary(details)
-    logBag.error_code = originalCode || mapped.body?.error?.code
+    const refusal = mapped.body?.error?.code === ErrorCode.REFUSAL_GUARD
+    logBag.error_code = refusal ? ErrorCode.REFUSAL_GUARD : originalCode || mapped.body?.error?.code
     logBag.error_message = summary || originalMessage || mapped.body?.error?.message || null
+    if (refusal) {
+      logBag.hop_meta = {
+        ...logBag.hop_meta,
+        refusal: {
+          blocked_by: mapped.body.error.details?.blocked_by || 'upstream',
+          retryable: false,
+          upstream_status: result?.status ?? null,
+          upstream_type: result?.body?.error?.type || null,
+          upstream_code: originalCode || null,
+          upstream_message: originalMessage ? String(originalMessage).slice(0, 2000) : null,
+        },
+      }
+    }
     if (logBag.classifier) {
       logBag.classifier.error = {
         status: result?.status || null,

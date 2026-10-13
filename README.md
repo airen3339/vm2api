@@ -120,9 +120,9 @@
 | 顺序 | 关 | 拦住什么 | 结果 |
 |:---|:---|:---|:---|
 | 1 | 蒸馏 | 收割模板、题目指纹、套取思维链的结构。OpenAI 平台模型不扫。默认再跳过官方 Claude Code 和 0 注入。 | 403，封 device |
-| 2 | 硬正则 | 色情、破解、破限和自定义正则。蒸馏类正则跟蒸馏总开关：关掉硬正则仍拦这些短语，关掉蒸馏才放行；官方客户端和 0 注入仍扫，OpenAI 不扫。 | 403 |
-| 3 | 拒答缓存 | 上游已经拒过的精确正文、近似正文，以及被封的 device。硬正则和决策模型自己的拦截不写入这张缓存。 | 503 |
-| 4 | 决策模型 | 安全模型逐题打分，低于阈值才拦。打分失败默认放行，并在「放行出站」里标出来。 | 403 |
+| 2 | 硬正则 | 直接用户文本中的色情、破解、破限和自定义正则。蒸馏类正则跟蒸馏总开关：关掉硬正则仍拦这些短语，关掉蒸馏才放行；官方客户端和 0 注入仍扫，OpenAI 不扫。 | 400；蒸馏类沿用蒸馏关状态 |
+| 3 | 拒答缓存 | 上游已经拒过的精确正文、近似正文，以及被封的 device。硬正则和决策模型自己的拦截不写入这张缓存。 | 403 |
+| 4 | 决策模型 | 安全模型逐题打分，低于阈值才拦。打分失败默认放行，并在「放行出站」里标出来。 | 400 |
 | 5 | 放行出站 | 前面都没拦。上游自己的拒答单独列出，用来看漏拦。 | 进入槽位 |
 
 每关可看今日命中和拦截流水。点开一条对正文；误伤就收这道关，不要删槽。判定记在请求日志里。这一版之前的旧日志没有判定，显示为「未经关卡」。
@@ -322,9 +322,9 @@ Details: [CHANGELOG.md](CHANGELOG.md). Guide: [vm2api.fkcodex.com/zh](https://vm
 | Order | Gate | What it stops | Result |
 |:---|:---|:---|:---|
 | 1 | Distill | Harvest templates, problem fingerprints, and chain-of-thought extraction shapes. OpenAI platform models are skipped. Official Claude Code and zero-injection are skipped by default. | 403, and the device is banned |
-| 2 | Hard regex | NSFW, cracking, jailbreak, and custom patterns. Distill-category patterns follow the distill switch, not the hard-regex switch, and still scan official clients and zero-injection. OpenAI platform models skip that category. | 403 |
-| 3 | Refusal cache | Exact text, similar text, and devices the upstream has already refused. Hard-regex and decision-model blocks are not stored here. | 503 |
-| 4 | Decision model | A safety model scores the text and blocks only below the threshold. If scoring fails, the request is allowed by default and marked on the pass column. | 403 |
+| 2 | Hard regex | NSFW, cracking, jailbreak, and custom patterns in direct user text. Distill-category patterns follow the distill switch, not the hard-regex switch, and still scan official clients and zero-injection. OpenAI platform models skip that category. | 400; distill patterns use the distill gate's status |
+| 3 | Refusal cache | Exact text, similar text, and devices the upstream has already refused. Hard-regex and decision-model blocks are not stored here. | 403 |
+| 4 | Decision model | A safety model scores the text and blocks only below the threshold. If scoring fails, the request is allowed by default and marked on the pass column. | 400 |
 | 5 | Passed egress | Everything the gates allowed. The upstream's own refusals are listed separately, so a miss is visible. | Enters a slot |
 
 Open a hit and read the body. A false positive means tighten that gate, not delete the slot. Requests from before this recording show as unchecked. Full rules: [docs/RISK.md](docs/RISK.md).

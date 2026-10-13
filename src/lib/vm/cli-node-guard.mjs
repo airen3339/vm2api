@@ -76,8 +76,9 @@ export function createCliNodeGuard({
 } = {}) {
   let timer = null
   let inTick = false
+  const pending = new Set()
 
-  async function tick() {
+  async function runTick() {
     if (inTick) return
     inTick = true
     try {
@@ -101,8 +102,21 @@ export function createCliNodeGuard({
     }
   }
 
+  const tick = () => {
+    const task = runTick()
+    pending.add(task)
+    task.then(
+      () => pending.delete(task),
+      () => pending.delete(task),
+    )
+    return task
+  }
+
   return {
     tick,
+    whenIdle: async () => {
+      while (pending.size) await Promise.allSettled([...pending])
+    },
     start({ immediate = true } = {}) {
       if (timer) return
       if (immediate) void tick()

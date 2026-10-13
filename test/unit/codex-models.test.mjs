@@ -3,9 +3,18 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
+import {
+  loadGptModelPolicy,
+  resetGptModelPolicy,
+  saveGptModelPolicy,
+  syncGptIdsIntoPolicy,
+  listNativeCodexModelCatalog,
+} from '../../src/lib/protocol/gpt-model-policy.mjs'
 import {
   clearModelsCache,
   isCodexCatalogModel,
+  gatewayModelCatalog,
   listOfficialModels,
   seedModelCatalog,
   validateOfficialModel,
@@ -21,6 +30,7 @@ import {
   normalizeCodexCatalogVersion,
   parseChatgptModelIds,
   parseCodexModelCatalog,
+  parseNativeCodexModelInfo,
   refreshCodexAccessToken,
   resolveCodexCatalogVersion,
 } from '../../src/lib/protocol/codex-models.mjs'
@@ -67,6 +77,93 @@ test('parseCodexModelCatalog uses official slug/display_name and drops luna-wm',
   )
   assert.equal(models[0].display_name, 'GPT-5.6')
   assert.deepEqual(parseChatgptModelIds({ models: [{ slug: 'gpt-5.6' }] }), ['gpt-5.6'])
+})
+
+test('parseCodexModelCatalog preserves complete native ModelInfo without fabricating it', () => {
+  const row = {
+    slug: 'gpt-6-sol',
+    display_name: 'GPT-6 Sol',
+    description: null,
+    supported_reasoning_levels: [{ effort: 'low', description: 'Low effort' }],
+    shell_type: 'unified_exec',
+    visibility: 'list',
+    supported_in_api: true,
+    priority: 1,
+    availability_nux: null,
+    upgrade: null,
+    support_verbosity: false,
+    default_verbosity: null,
+    apply_patch_tool_type: null,
+    truncation_policy: { mode: 'tokens', limit: 272000 },
+    experimental_supported_tools: [],
+    future_field: 'preserved',
+  }
+  const parsed = parseCodexModelCatalog({ models: [row, { slug: 'gpt-6-luna', display_name: 'Luna' }] })
+  assert.deepEqual(parsed[0].codex_model_info, row)
+  assert.equal(parsed[1].codex_model_info, undefined)
+  assert.equal(parseNativeCodexModelInfo({ ...row, slug: 'wrong' }, 'gpt-6-sol', row.display_name), null)
+  for (const invalid of [
+    { supported_in_api: 'true' },
+    { truncation_policy: { mode: 'tokens', limit: '272000' } },
+    { description: {} },
+    { default_verbosity: 1 },
+    { apply_patch_tool_type: {} },
+    { supported_reasoning_levels: [{ effort: 'low', description: 1 }] },
+    { experimental_supported_tools: [1] },
+  ]) {
+    assert.equal(parseNativeCodexModelInfo({ ...row, ...invalid }, row.slug, row.display_name), null)
+  }
+})
+
+test('native ModelInfo survives parse, policy sync, database reload, and filters disabled or incomplete rows', () => {
+  openDatabase({ dbPath: ':memory:' })
+  try {
+    resetGptModelPolicy()
+    saveGptModelPolicy({ models: { 'gpt-disabled': { enabled: false } } })
+    const native = {
+      slug: 'gpt-6-sol',
+      display_name: 'GPT-6 Sol',
+      description: null,
+      supported_reasoning_levels: [{ effort: 'low', description: 'Low effort' }],
+      shell_type: 'unified_exec',
+      visibility: 'list',
+      supported_in_api: true,
+      priority: 1,
+      availability_nux: null,
+      upgrade: null,
+      support_verbosity: false,
+      default_verbosity: null,
+      apply_patch_tool_type: null,
+      truncation_policy: { mode: 'tokens', limit: 272000 },
+      experimental_supported_tools: ['computer'],
+    }
+    const parsed = parseCodexModelCatalog({
+      models: [
+        native,
+        { ...native, slug: 'gpt-disabled', display_name: 'Disabled' },
+        { slug: 'gpt-missing', display_name: 'Missing' },
+        { ...native, slug: 'claude-sonnet-5', display_name: 'Claude' },
+      ],
+    })
+    syncGptIdsIntoPolicy(parsed)
+    loadGptModelPolicy({ force: true })
+    assert.deepEqual(
+      listNativeCodexModelCatalog().map((model) => model.slug),
+      ['gpt-6-sol'],
+    )
+    assert.equal(listNativeCodexModelCatalog()[0].shell_type, 'unified_exec')
+  } finally {
+    resetGptModelPolicy()
+    closeDatabase()
+  }
+})
+
+test('generic gateway catalog keeps the OpenAI-compatible shape', () => {
+  const catalog = gatewayModelCatalog()
+  assert.equal(catalog.object, 'list')
+  assert.ok(Array.isArray(catalog.data))
+  assert.equal(Object.hasOwn(catalog, 'models'), false)
+  assert.ok(catalog.data.some((model) => String(model.id).startsWith('claude-')))
 })
 
 test('fetchChatgptModelCatalog hits /codex/models and does not treat 401 as success', async () => {

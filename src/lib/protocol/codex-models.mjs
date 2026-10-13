@@ -117,6 +117,65 @@ function isCodexRequestSlug(id) {
   return isSyncableGptCatalogId(id)
 }
 
+const NATIVE_CODEX_MODEL_FIELDS = Object.freeze([
+  'slug',
+  'display_name',
+  'description',
+  'supported_reasoning_levels',
+  'shell_type',
+  'visibility',
+  'supported_in_api',
+  'priority',
+  'availability_nux',
+  'upgrade',
+  'support_verbosity',
+  'default_verbosity',
+  'apply_patch_tool_type',
+  'truncation_policy',
+  'experimental_supported_tools',
+])
+
+/** Keep complete upstream ModelInfo only when it is actually native-shaped. */
+export function parseNativeCodexModelInfo(row, id, displayName) {
+  if (!row || typeof row !== 'object') return null
+  if (!NATIVE_CODEX_MODEL_FIELDS.every((field) => Object.prototype.hasOwnProperty.call(row, field))) return null
+  if (String(row.slug || '').trim() !== id) return null
+  if (typeof row.display_name !== 'string' || !row.display_name.trim()) return null
+  for (const field of ['description', 'default_verbosity', 'apply_patch_tool_type']) {
+    if (row[field] !== null && typeof row[field] !== 'string') return null
+  }
+  if (
+    !Array.isArray(row.supported_reasoning_levels) ||
+    !row.supported_reasoning_levels.every(
+      (level) =>
+        level &&
+        typeof level === 'object' &&
+        typeof level.effort === 'string' &&
+        level.effort.trim() &&
+        (level.description === null || typeof level.description === 'string'),
+    )
+  )
+    return null
+  if (typeof row.shell_type !== 'string' || !row.shell_type.trim()) return null
+  if (typeof row.visibility !== 'string' || !row.visibility.trim()) return null
+  if (typeof row.supported_in_api !== 'boolean') return null
+  if (!Number.isFinite(row.priority)) return null
+  if (typeof row.support_verbosity !== 'boolean') return null
+  if (
+    !row.truncation_policy ||
+    typeof row.truncation_policy !== 'object' ||
+    typeof row.truncation_policy.mode !== 'string' ||
+    !Number.isFinite(row.truncation_policy.limit)
+  )
+    return null
+  if (
+    !Array.isArray(row.experimental_supported_tools) ||
+    !row.experimental_supported_tools.every((tool) => typeof tool === 'string')
+  )
+    return null
+  return { ...row, slug: id, display_name: displayName }
+}
+
 /**
  * Official Codex catalog: `{ models: [{ slug, display_name }] }`.
  * Does not walk ChatGPT web `/backend-api/models` consumer trees.
@@ -130,9 +189,12 @@ export function parseCodexModelCatalog(payload) {
     const id = String(row.slug || row.id || '').trim()
     if (!id || !isCodexRequestSlug(id) || seen.has(id.toLowerCase())) continue
     seen.add(id.toLowerCase())
+    const displayName = String(row.display_name || row.title || id).trim() || id
+    const nativeInfo = parseNativeCodexModelInfo(row, id, displayName)
     out.push({
       id,
-      display_name: String(row.display_name || row.title || id).trim() || id,
+      display_name: displayName,
+      ...(nativeInfo ? { codex_model_info: nativeInfo } : {}),
     })
   }
   return out

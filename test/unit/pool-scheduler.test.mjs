@@ -619,7 +619,7 @@ test('scheduler hard-excludes worker refresh failure', async (t) => {
   selected.release()
 })
 
-test('maxConcurrency 0 does not fall back to 20', async (t) => {
+test('maxConcurrency 0 removes the scheduler concurrency cap', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   for (const id of ['vm-01', 'vm-02']) {
@@ -633,8 +633,9 @@ test('maxConcurrency 0 does not fall back to 20', async (t) => {
     model: 'claude-test',
     allowWait: false,
   })
-  assert.equal(selected.ok, false)
-  assert.equal(selected.reason, 'no_eligible_accounts')
+  assert.equal(selected.ok, true)
+  assert.equal(selected.maxConcurrency, Number.MAX_SAFE_INTEGER)
+  selected.release()
 })
 
 test('maxConcurrency 8 is the actual reserve cap', async (t) => {
@@ -1855,8 +1856,8 @@ test('skipSessionSlot probe still obeys concurrency quota cooldown and hard bloc
     allowWait: false,
     skipSessionSlot: true,
   })
-  assert.equal(overloaded.reason, 'pool_overload_cooldown')
-  assert.ok(overloaded.retry_after_ms > 20_000 && overloaded.retry_after_ms <= 30_000)
+  assert.equal(overloaded.reason, 'all_accounts_busy')
+  assert.equal(overloaded.retry_after_ms, undefined)
 })
 
 test('exact sticky session outranks device VM affinity', async (t) => {
@@ -2117,6 +2118,74 @@ test('overload_until gates the account until it passes', async (t) => {
   assert.equal(selected.ok, true)
   assert.equal(selected.vmId, 'vm-01')
   selected.release()
+})
+
+test('a sole overloaded account reports capacity busy with its recovery time', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const stopped = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-02.json'), 'utf8'))
+  stopped.status = 'paused'
+  stopped.schedulable = false
+  fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify(stopped))
+  const runtimeRepo = new RuntimeRepo()
+  const until = Date.now() + 600_000
+  runtimeRepo.upsert({ account_id: 'account-1', vm_id: 'vm-01', overload_until: until })
+  const pool = scheduler(root, { runtimeRepo })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.reason, 'all_accounts_busy')
+  assert.equal(selected.eligible, 1)
+  assert.ok(selected.soonest_available_ms > 590_000)
+  assert.ok(selected.soonest_available_ms < 610_000)
+  assert.ok(selected.wait_reasons.includes('account_cooldown'))
+})
+
+test('a sole circuit-open account remains a temporary capacity wait', async (t) => {
+  const root = project()
+  const { unitCircuit } = await import('../../src/lib/pool/unit-circuit.mjs')
+  t.after(() => {
+    unitCircuit.reset('account-1')
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const stopped = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-02.json'), 'utf8'))
+  stopped.status = 'paused'
+  stopped.schedulable = false
+  fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify(stopped))
+  for (let i = 0; i < unitCircuit.failureThreshold; i++) unitCircuit.recordFailure('account-1')
+  const until = unitCircuit.snapshot('account-1').openUntil
+  const started = Date.now()
+  const selected = await scheduler(root).selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.reason, 'all_accounts_busy')
+  assert.equal(selected.eligible, 1)
+  assert.ok(selected.soonest_available_ms > 0)
+  assert.ok(selected.soonest_available_ms <= until - started)
+  assert.ok(selected.soonest_available_ms >= until - Date.now())
+  assert.ok(selected.wait_reasons.includes('circuit_probe'))
+})
+
+test('simultaneous cooldowns wait for the last gate to recover', async (t) => {
+  const root = project()
+  const { unitCircuit } = await import('../../src/lib/pool/unit-circuit.mjs')
+  t.after(() => {
+    unitCircuit.reset('account-1')
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const runtimeRepo = new RuntimeRepo()
+  runtimeRepo.upsert({ account_id: 'account-1', vm_id: 'vm-01', overload_until: Date.now() + 600_000 })
+  for (let i = 0; i < unitCircuit.failureThreshold; i++) unitCircuit.recordFailure('account-1')
+  const selected = await scheduler(root, { runtimeRepo }).selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.reason, 'all_accounts_busy')
+  assert.ok(selected.soonest_available_ms > 590_000)
+  assert.ok(selected.soonest_available_ms <= 600_000)
 })
 
 test('passive quota sync never clears a live 429 block', async (t) => {
@@ -2707,4 +2776,88 @@ test('a vm pool drops a sticky VM that is no longer a member', async (t) => {
   })
   assert.equal(blocked.ok, false)
   assert.equal(blocked.vmId, undefined)
+})
+
+test('an empty pool names why each slot was rejected', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root, {
+    accountQuota: { canAccept: () => ({ ok: false, reason: 'quota_7d_cli' }) },
+  })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.eligible, 0)
+  assert.deepEqual(
+    selected.rejected.map((item) => item.reason),
+    selected.rejected.map(() => 'quota_7d_cli'),
+  )
+  assert.ok(selected.rejected.length > 0)
+  assert.match(formatPoolSelectionSummary(selected), /^no_eligible_accounts eligible=0 rejected=vm-\d+:quota_7d_cli/)
+})
+
+test('fable empty-pool errors distinguish Max quota from tier rejection', async (t) => {
+  const cases = [
+    {
+      name: 'Max quota-only',
+      setup: () => {},
+      accountQuota: { canAccept: () => ({ ok: false, reason: 'quota_5h_header' }) },
+      expected: 'no_eligible_accounts',
+      reasons: ['quota_5h_header', 'quota_5h_header'],
+    },
+    {
+      name: 'all non-Max',
+      setup: (root) => {
+        writeTier(root, 'vm-01', 'pro')
+        writeTier(root, 'vm-02', null)
+      },
+      expected: 'fable_requires_max',
+      reasons: ['fable_requires_max', 'fable_requires_max'],
+    },
+    {
+      name: 'mixed tier and quota rejection',
+      setup: (root) => writeTier(root, 'vm-01', 'pro'),
+      accountQuota: { canAccept: () => ({ ok: false, reason: 'quota_5h_header' }) },
+      expected: 'no_eligible_accounts',
+      reasons: ['fable_requires_max', 'quota_5h_header'],
+    },
+    {
+      name: 'truly empty',
+      setup: (root) => {
+        for (const id of ['vm-01', 'vm-02']) {
+          const file = path.join(root, 'vms', `${id}.json`)
+          const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+          vm.schedulable = false
+          fs.writeFileSync(file, JSON.stringify(vm))
+        }
+      },
+      expected: 'no_eligible_accounts',
+      reasons: ['vm_unschedulable', 'vm_unschedulable'],
+    },
+  ]
+
+  for (const scenario of cases) {
+    const root = project()
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    scenario.setup(root)
+    const pool = scheduler(root, scenario.accountQuota ? { accountQuota: scenario.accountQuota } : {})
+    const selected = await pool.selectAndReserve({
+      model: 'claude-fable-5-1',
+      allowWait: false,
+      excluded: scenario.excluded,
+      pinVmId: scenario.pinVmId,
+    })
+    const peek = await pool.peekAccount({ model: 'claude-fable-5-1' })
+    assert.equal(selected.reason, scenario.expected, scenario.name)
+    assert.equal(peek.code, scenario.expected, scenario.name)
+    assert.deepEqual(
+      selected.rejected.map((item) => item.reason),
+      scenario.reasons,
+      scenario.name,
+    )
+    assert.deepEqual(
+      peek.rejected.map((item) => item.reason),
+      scenario.reasons,
+      scenario.name,
+    )
+  }
 })

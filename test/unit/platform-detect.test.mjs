@@ -21,9 +21,19 @@ test('claude-opus-4-8 always selects the Anthropic platform', () => {
   assert.equal(detectInboundPlatform('openrouter/anthropic/claude-opus-4-8').platform, 'anthropic')
 })
 
+test('detectInboundPlatform accepts the Codex auto-review supporting model', () => {
+  assert.deepEqual(detectInboundPlatform('codex-auto-review'), {
+    ok: true,
+    platform: 'openai',
+    model: 'codex-auto-review',
+  })
+})
+
 test('detectInboundPlatform fail-closes unknown and non-chat gpt', () => {
   assert.equal(detectInboundPlatform('o3').ok, false)
-  assert.equal(detectInboundPlatform('codex-auto-review').ok, false)
+  assert.equal(detectInboundPlatform('codex-mini').ok, false)
+  assert.equal(detectInboundPlatform('codex-auto-review-extra').ok, false)
+  assert.equal(detectInboundPlatform('codex-unknown').ok, false)
   assert.equal(detectInboundPlatform('gpt-image-1').ok, false)
   assert.equal(detectInboundPlatform('').ok, false)
 })

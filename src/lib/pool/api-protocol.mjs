@@ -1,4 +1,6 @@
 import { officialMessagesBody } from '../protocol/anthropic-messages.mjs'
+import { stripIllegalCacheControlFields } from '../protocol/cache-ttl.mjs'
+import { apiKeyBetaHeader, withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { prepareClassifierBody } from '../protocol/request-purpose.mjs'
 import { consumeClaudeSSEData } from '../protocol/convert.mjs'
 import { mapUpstreamError } from '../core/errors.mjs'
@@ -70,7 +72,7 @@ export async function runApiInference({
   converters,
   requestContext = null,
 } = {}) {
-  const canonical = officialMessagesBody(convertedBody)
+  const canonical = stripIllegalCacheControlFields(officialMessagesBody(convertedBody))
   const model = canonical.model
   const picked = scheduler.pick(model)
   if (!picked.ok) {
@@ -113,6 +115,12 @@ export async function runApiInference({
       ...extraHeaders,
       auth_scheme: picked.endpoint.auth_scheme || extraHeaders.auth_scheme || extraHeaders.anthropic_apikey_auth_scheme,
     }),
+  }
+  if (!isOpenAI) {
+    headers['anthropic-beta'] = withRequestProtocolBetas(
+      apiKeyBetaHeader(headers['anthropic-beta'] || req?.headers?.['anthropic-beta'] || '').split(','),
+      body,
+    ).join(',')
   }
 
   let upstream

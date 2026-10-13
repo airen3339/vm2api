@@ -194,6 +194,48 @@ test('startScheduler immediately repairs enabled egress', async () => {
   }
 })
 
+test('startup restores network rules even when the egress listener is healthy', async () => {
+  const socks = await listenSocks()
+  let repairs = 0
+  const pool = new ProxyPool({
+    dataDir: tmpDir(),
+    egressCheck: () => ({ ok: true }),
+    repairEgress: () => {
+      repairs += 1
+      return { ok: true }
+    },
+  })
+  try {
+    pool.importLines(`${socks.host}:${socks.port}`)
+    pool.startScheduler()
+    const deadline = Date.now() + 1000
+    while (pool._probing && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(repairs, 1)
+    await pool.probeAll({ onlyEnabled: true })
+    assert.equal(repairs, 1, 'periodic probes must not continually rewrite network rules')
+  } finally {
+    pool.stopScheduler()
+    socks.server.close()
+  }
+})
+
+test('a forced egress repair failure cannot be masked by a healthy listener', async () => {
+  for (const repairEgress of [
+    () => ({ ok: false }),
+    () => {
+      throw new Error('repair failed')
+    },
+  ]) {
+    const pool = new ProxyPool({ dataDir: tmpDir(), egressCheck: () => ({ ok: true }), repairEgress })
+    pool.importLines('127.0.0.1:20001')
+    pool._probeSocks = async () => ({ ok: true, latency_ms: 1 })
+    const result = await pool.probeOne(pool.state.proxies[0], { repairEgress: true })
+    assert.equal(result.ok, false)
+    assert.equal(result.scope, 'egress')
+    assert.equal(result.error, 'egress_repair_failed')
+  }
+})
+
 test('egress_down does not mark a live SOCKS proxy dead', async () => {
   const socks = await listenSocks()
   const pool = new ProxyPool({

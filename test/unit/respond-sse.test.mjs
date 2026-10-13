@@ -52,6 +52,21 @@ test('default max body fallback is 128MB', () => {
   assert.match(src, /KIN_MAX_BODY \|\| 128 \* 1024 \* 1024/)
 })
 
+test('non-retryable JSON errors tell SDKs to stop automatic retries', () => {
+  const { json } = createRespond({ rewrite: { enabled: false } })
+  let headers
+  const res = {
+    writeHead(_status, value) {
+      headers = value
+    },
+    end() {},
+  }
+  json(res, 403, { error: { details: { retryable: false } } })
+  assert.equal(headers['x-should-retry'], 'false')
+  json(res, 503, { error: { code: 'upstream_network_error' } })
+  assert.equal(headers['x-should-retry'], undefined)
+})
+
 test('oversized protocol body returns 413 before scheduling', async () => {
   let scheduled = false
   const { handleProtocol } = createHandleProtocol({

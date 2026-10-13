@@ -372,6 +372,7 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
     wait_reasons: selected?.wait_reasons || [],
     eligible: selected?.eligible ?? 0,
     available: selected?.available ?? 0,
+    rejected: selected?.rejected || [],
     sticky_cleared: !!selected?.sticky_cleared,
     attempt_count: hops,
     last_reason: lastPolicy?.reason || null,
@@ -860,7 +861,11 @@ export class FailoverRunner {
           await onAttempt({ attemptNo, selected, result, policy })
         }
         if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
-          this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
+          // A CLI-wrapped 5xx refusal ends this request, but must not clear
+          // a real account cooldown established by another in-flight request.
+          if (Number(result.status) >= 200 && Number(result.status) < 300) {
+            this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
+          }
           bindAll({ accountId: selected.accountId, vmId: selected.vmId })
           return {
             ...result,

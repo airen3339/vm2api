@@ -1,8 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { prepareCliHopBody, stripCliOwnedSystem } from '../../src/lib/protocol/outbound-attempt.mjs'
+import {
+  prepareCliHopBody,
+  prepareOutboundAttempt,
+  stripCliOwnedSystem,
+} from '../../src/lib/protocol/outbound-attempt.mjs'
 import { CRS_OFFICIAL_SYSTEM, CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/official-cc-system-2.1.241.mjs'
+import { applyMessageBreakpoints } from '../../src/lib/protocol/cache-ttl.mjs'
 
 test('prepareCliHopBody drops metadata and CLI-owned system but keeps official agent leftover', () => {
   const body = prepareCliHopBody({
@@ -76,6 +81,102 @@ test('prepareCliHopBody does not overwrite caller thinking disabled', () => {
   })
   assert.equal(body.thinking.type, 'disabled')
   assert.equal(body.context_management, undefined)
+})
+
+for (const model of ['claude-sonnet-5.5', 'claude-opus-5.5']) {
+  for (const repaired of [false, true]) {
+    test(`cli-hop preserves native updates for ${model}, repaired=${repaired}`, () => {
+      const thinking = { type: 'adaptive', display: 'updates' }
+      const body = prepareCliHopBody(
+        {
+          model,
+          max_tokens: 128000,
+          thinking,
+          output_config: { effort: 'high' },
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+        { repaired },
+      )
+      assert.deepEqual(body.thinking, { type: 'adaptive', display: 'updates' })
+      assert.equal(body.max_tokens, 128000)
+      assert.equal(body.output_config.effort, 'high')
+      assert.deepEqual(thinking, { type: 'adaptive', display: 'updates' }, 'preserve caller thinking')
+    })
+  }
+}
+
+for (const repaired of [false, true]) {
+  test(`cli-hop preserves updates on manual enabled thinking, repaired=${repaired}`, () => {
+    const body = prepareCliHopBody(
+      {
+        model: 'claude-sonnet-4-5',
+        max_tokens: 4096,
+        thinking: { type: 'enabled', budget_tokens: 2048, display: 'updates' },
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+      { repaired },
+    )
+    assert.deepEqual(body.thinking, { type: 'enabled', budget_tokens: 2048, display: 'updates' })
+    assert.equal(body.max_tokens, 4096)
+  })
+}
+
+test('cli-hop preserves updates after Opus 5.5 enabled-to-adaptive normalization', () => {
+  const body = prepareCliHopBody({
+    model: 'claude-opus-5.5',
+    max_tokens: 128000,
+    thinking: { type: 'enabled', budget_tokens: 8000, display: 'updates' },
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.deepEqual(body.thinking, { type: 'adaptive', display: 'updates' })
+})
+
+for (const display of ['summarized', 'omitted', 'future-display', 'UPDATES', ' updates ']) {
+  test(`cli-hop preserves caller display ${JSON.stringify(display)}`, () => {
+    const body = prepareCliHopBody({
+      model: 'claude-sonnet-5.5',
+      thinking: { type: 'adaptive', display },
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    assert.deepEqual(body.thinking, { type: 'adaptive', display })
+  })
+}
+
+test('cli-hop keeps Haiku thinking disabled when caller requests updates', () => {
+  const body = prepareCliHopBody({
+    model: 'claude-haiku-4-5',
+    thinking: { type: 'adaptive', display: 'updates' },
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.deepEqual(body.thinking, { type: 'disabled' })
+})
+
+test('cli-hop does not translate updates on disabled thinking', () => {
+  const body = prepareCliHopBody({
+    model: 'claude-sonnet-5',
+    thinking: { type: 'disabled', display: 'updates' },
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.deepEqual(body.thinking, { type: 'disabled', display: 'updates' })
+})
+
+test('HTTP outbound keeps updates for a provider supporting its beta', () => {
+  const canonicalBody = {
+    model: 'claude-sonnet-5.5',
+    max_tokens: 4096,
+    thinking: { type: 'adaptive', display: 'updates' },
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+  const body = prepareOutboundAttempt({
+    canonicalBody,
+    officialClient: true,
+    identity: {
+      vmId: 'vm-fixture',
+      deviceId: 'd'.repeat(64),
+      accountUuid: '11111111-1111-4111-8111-111111111111',
+    },
+  }).body
+  assert.deepEqual(body.thinking, { type: 'adaptive', display: 'updates' })
 })
 
 test('prepareCliHopBody strips unsigned empty dummy and short thinking history', () => {
@@ -220,6 +321,137 @@ function messageMarkers(body) {
   }
   return hits
 }
+
+function freezeTree(value) {
+  if (!value || typeof value !== 'object') return value
+  for (const child of Object.values(value)) freezeTree(child)
+  return Object.freeze(value)
+}
+
+for (const cacheTtl of ['5m', '1h']) {
+  for (const repaired of [false, true]) {
+    test(`cli-hop caches merged Sonnet history before a changing tail, ttl=${cacheTtl}, repaired=${repaired}`, () => {
+      let blocks = Array.from({ length: 105 }, (_, i) => ({ type: 'text', text: `History block ${i}.` }))
+      let previous = null
+      for (let turn = 0; turn < 3; turn++) {
+        if (turn) {
+          blocks = blocks.map((block, i) =>
+            i < blocks.length - 2 ? block : { ...block, text: `${block.text} Updated ${turn}.` },
+          )
+          blocks.push({ type: 'text', text: `New tail ${turn}.` })
+        }
+        const incoming = freezeTree({
+          model: 'claude-sonnet-5.5',
+          max_tokens: 2112,
+          messages: [
+            { role: 'user', content: [{ ...blocks[0], cache_control: { type: 'ephemeral', scope: 'global' } }] },
+            {
+              role: 'user',
+              content: blocks.slice(1).map((block) => ({ ...block, cache_control: { type: 'ephemeral', ttl: '5m' } })),
+            },
+          ],
+        })
+        const snapshot = structuredClone(incoming)
+        const body = prepareCliHopBody(incoming, { cacheTtl, repaired })
+        assert.deepEqual(incoming, snapshot, 'caller body is immutable')
+        assert.deepEqual(
+          body.messages.map((message) => message.role),
+          ['user'],
+        )
+        assert.deepEqual(withoutMessageCache(body).messages[0].content, blocks, 'only cache markers change')
+        assert.deepEqual(messageMarkers(body), [
+          { index: 0, blockIndex: blocks.length - 3, type: 'text', ttl: cacheTtl },
+          { index: 0, blockIndex: blocks.length - 1, type: 'text', ttl: cacheTtl },
+        ])
+        for (const block of body.messages[0].content.filter((block) => block.cache_control)) {
+          assert.deepEqual(block.cache_control, { type: 'ephemeral', ttl: cacheTtl })
+        }
+        if (previous) {
+          let shared = 0
+          const currentBlocks = withoutMessageCache(body).messages[0].content
+          const previousBlocks = withoutMessageCache(previous).messages[0].content
+          while (shared < previousBlocks.length && currentBlocks[shared].text === previousBlocks[shared].text) shared++
+          assert.equal(shared, blocks.length - 3)
+          const previousAnchor = messageMarkers(previous)[0].blockIndex
+          assert.equal(previousAnchor, shared - 1, "the previous history marker is inside this turn's stable prefix")
+          assert.deepEqual(currentBlocks.slice(0, shared), previousBlocks.slice(0, shared))
+        }
+        previous = body
+      }
+    })
+  }
+}
+
+test('cli-hop single-user history anchor starts at four nonempty text blocks', () => {
+  for (let count = 1; count <= 4; count++) {
+    const body = prepareCliHopBody({
+      model: 'claude-sonnet-5.5',
+      messages: [
+        { role: 'user', content: Array.from({ length: count }, (_, i) => ({ type: 'text', text: `Block ${i}.` })) },
+      ],
+    })
+    assert.deepEqual(
+      messageMarkers(body).map((hit) => hit.blockIndex),
+      count < 4 ? [count - 1] : [1, 3],
+    )
+  }
+})
+
+for (const [kind, block] of [
+  ['image', { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'fixture' } }],
+  ['document', { type: 'document', source: { type: 'text', media_type: 'text/plain', data: 'fixture' } }],
+  ['tool_result', { type: 'tool_result', tool_use_id: 'fixture', content: 'result' }],
+  ['thinking', { type: 'thinking', thinking: 'history', signature: 'sig'.repeat(10) }],
+  ['redacted_thinking', { type: 'redacted_thinking', data: 'fixture' }],
+  ['blank text', { type: 'text', text: '  ' }],
+]) {
+  test(`cli-hop does not add a history marker to a single user with ${kind}`, () => {
+    const body = prepareCliHopBody({
+      model: 'claude-sonnet-5.5',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'First.' },
+            block,
+            { type: 'text', text: 'History.' },
+            { type: 'text', text: 'Tail.' },
+          ],
+        },
+      ],
+    })
+    assert.equal(messageMarkers(body).length, 1)
+    assert.equal(messageMarkers(body)[0].blockIndex, body.messages[0].content.length - 1)
+  })
+}
+
+test('generic HTTP rewrite keeps only the tail marker for a single user with text blocks', () => {
+  const incoming = freezeTree({
+    messages: [
+      { role: 'user', content: Array.from({ length: 106 }, (_, i) => ({ type: 'text', text: `Block ${i}.` })) },
+    ],
+  })
+  const body = applyMessageBreakpoints(incoming, '5m', 'rewrite')
+  assert.deepEqual(messageMarkers(body), [{ index: 0, blockIndex: 105, type: 'text', ttl: '5m' }])
+  assert.deepEqual(withoutMessageCache(body), incoming)
+})
+
+test('cli-hop keeps Opus multi-message anchors with a multi-block last user', () => {
+  const body = prepareCliHopBody({
+    model: 'claude-opus-5.5',
+    messages: [
+      { role: 'user', content: 'First.' },
+      { role: 'assistant', content: 'Answer.' },
+      { role: 'user', content: 'Second.' },
+      { role: 'assistant', content: 'Answer again.' },
+      { role: 'user', content: Array.from({ length: 106 }, (_, i) => ({ type: 'text', text: `Block ${i}.` })) },
+    ],
+  })
+  assert.deepEqual(messageMarkers(body), [
+    { index: 2, blockIndex: 0, type: 'text', ttl: '1h' },
+    { index: 4, blockIndex: 105, type: 'text', ttl: '1h' },
+  ])
+})
 
 test('cli-hop drops caller system/tools markers and restamps last plus penultimate user', () => {
   const body = prepareCliHopBody(

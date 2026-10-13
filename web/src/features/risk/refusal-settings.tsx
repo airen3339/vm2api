@@ -121,7 +121,7 @@ export function RefusalSettings() {
     <div className='space-y-8 p-4'>
       <Group
         title='何时拦截'
-        hint='上游拒答过的正文记成指纹。精确命中直接 503；近似只比较用户正文，短于 512 字不做。改动立即生效。'
+        hint='上游拒答过的正文记成指纹。精确命中返回不可自动重试的 403；近似只比较用户正文，短于 512 字不做。改动立即生效。'
       >
         <ToggleList>
           <ToggleItem label='拦截重复拒答' desc='REFUSAL_GUARD=0 会关掉整关'>

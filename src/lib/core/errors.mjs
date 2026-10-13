@@ -147,7 +147,36 @@ export function isUsagePolicyErrorMessage(message = '') {
 }
 
 export const REFUSAL_GUARD_MESSAGE =
-  "Request blocked by the refusal guard. Anthropic's API previously refused this pattern."
+  'Request blocked by the refusal guard because Anthropic previously refused this exact request. Do not retry this request.'
+
+const REFUSAL_GUARD_MESSAGES = Object.freeze({
+  exact: REFUSAL_GUARD_MESSAGE,
+  similar:
+    'Request blocked by the refusal guard because it matches a similar request Anthropic previously refused. Do not retry this request.',
+  device:
+    'Request blocked by the refusal guard because this client device is blocked after a prior policy rejection. Automatic retries will not unblock it; contact the gateway administrator for review.',
+  upstream: 'Anthropic refused this request under its usage policy. Do not retry this request.',
+})
+
+/** Policy refusals are permanent for this request, not a transient service failure. */
+export function makeRefusalGuardError({ requestId, blockedBy = 'upstream', sourceRequestId, details = {} } = {}) {
+  const kind = Object.hasOwn(REFUSAL_GUARD_MESSAGES, blockedBy) ? blockedBy : 'upstream'
+  const safeDetails = { ...details, blocked_by: kind, retryable: false }
+  delete safeDetails.source_request_id
+  // Only a gateway UUID may leave the device record; never expose its id, prompt or raw reason.
+  const sourceId = typeof sourceRequestId === 'string' ? sourceRequestId.trim() : ''
+  if (kind === 'device' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sourceId)) {
+    safeDetails.source_request_id = sourceId
+  }
+  return makeError({
+    type: ErrorType.PERMISSION,
+    code: ErrorCode.REFUSAL_GUARD,
+    message: REFUSAL_GUARD_MESSAGES[kind],
+    status: 403,
+    request_id: requestId,
+    details: safeDetails,
+  })
+}
 
 /**
  * `overloaded` (real capacity, 529), `rate_limited` (every account in an
@@ -452,17 +481,21 @@ export function mapUpstreamError(status, body, headers = {}) {
   }
   const request_id =
     body?.error?.request_id || body?.request_id || headers['request-id'] || headers['x-request-id'] || null
+  if (inboundCode === ErrorCode.REFUSAL_GUARD) {
+    const prior = body?.error?.details || {}
+    return makeRefusalGuardError({
+      requestId: request_id,
+      blockedBy: prior.blocked_by,
+      sourceRequestId: prior.source_request_id,
+    })
+  }
   if (isUsagePolicyErrorMessage(msg)) {
-    return makeError({
-      type: ErrorType.PERMISSION,
-      code: ErrorCode.REFUSAL_GUARD,
-      message: REFUSAL_GUARD_MESSAGE,
-      status: 503,
+    return makeRefusalGuardError({
+      requestId: request_id,
       details: {
         upstream_type: upType,
         upstream_status: status,
       },
-      request_id,
     })
   }
   if (inboundCode === ErrorCode.CONTENT_FILTER_REFUSAL) {

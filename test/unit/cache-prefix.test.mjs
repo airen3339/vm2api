@@ -48,6 +48,10 @@ test('the first changed section is reported', () => {
     section: 'messages',
     index: 1,
     kind: 'text',
+    blockIndex: 0,
+    previousBlocks: 1,
+    currentBlocks: 1,
+    sharedPrefixBlocks: 0,
   })
   assert.deepEqual(trackCachePrefix('s', body('p2', 'u1'), 3).break, {
     section: 'messages',
@@ -110,4 +114,70 @@ test('inbound to outbound image edits are classified without storing bytes', () 
   assert.equal(described.session_id, 'sess')
   assert.equal(described.vm_id, 'vm-01')
   assert.equal(described.account_id, 'acc')
+})
+
+test('alternating models keep separate histories within one session', () => {
+  clearCachePrefixSessions()
+  const opus = { ...body('opus system', 'u1'), model: 'claude-opus-5-5' }
+  const sonnet = { ...body('sonnet system', 'aux'), model: 'claude-sonnet-5', tools: [] }
+  assert.deepEqual(trackCachePrefix('shared', opus, 0), { turn: 1, break: null })
+  assert.deepEqual(trackCachePrefix('shared', sonnet, 1), { turn: 1, break: null })
+  assert.deepEqual(
+    trackCachePrefix('shared', { ...opus, messages: [...opus.messages, { role: 'assistant', content: 'a1' }] }, 2),
+    { turn: 2, break: null },
+  )
+  assert.deepEqual(trackCachePrefix('shared', sonnet, 3), { turn: 2, break: null })
+})
+
+const mergedUser = (...texts) => ({
+  model: 'claude-sonnet-5',
+  messages: [{ role: 'user', content: texts.map((text) => ({ type: 'text', text })) }],
+})
+
+test('merged-user block growth reports the shared stable prefix without prompt bytes', () => {
+  clearCachePrefixSessions()
+  trackCachePrefix('aux', mergedUser('stable', 'history'), 0)
+  const result = trackCachePrefix('aux', mergedUser('stable', 'history', 'new query'), 1)
+  assert.deepEqual(result, {
+    turn: 2,
+    break: {
+      section: 'messages',
+      index: 0,
+      kind: 'structure',
+      blockIndex: 2,
+      previousBlocks: 2,
+      currentBlocks: 3,
+      sharedPrefixBlocks: 2,
+    },
+  })
+  assert.equal(JSON.stringify(result).includes('stable'), false)
+  assert.equal(JSON.stringify(result).includes('history'), false)
+})
+
+test('replacing multiple merged-user tail blocks locates the first changed block', () => {
+  clearCachePrefixSessions()
+  trackCachePrefix('aux', mergedUser('stable', 'history', 'old query', 'old detail'), 0)
+  assert.deepEqual(trackCachePrefix('aux', mergedUser('stable', 'history', 'new query', 'new detail'), 1).break, {
+    section: 'messages',
+    index: 0,
+    kind: 'text',
+    blockIndex: 2,
+    previousBlocks: 4,
+    currentBlocks: 4,
+    sharedPrefixBlocks: 2,
+  })
+})
+
+test('shortening a merged-user tail reports the removal boundary', () => {
+  clearCachePrefixSessions()
+  trackCachePrefix('aux', mergedUser('stable', 'history', 'tail'), 0)
+  assert.deepEqual(trackCachePrefix('aux', mergedUser('stable', 'history'), 1).break, {
+    section: 'messages',
+    index: 0,
+    kind: 'structure',
+    blockIndex: 2,
+    previousBlocks: 3,
+    currentBlocks: 2,
+    sharedPrefixBlocks: 2,
+  })
 })

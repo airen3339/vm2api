@@ -24,6 +24,11 @@ COPY deploy/payload.json deploy/payload.json
 COPY scripts/fetch-payload.mjs scripts/fetch-payload.mjs
 RUN node scripts/fetch-payload.mjs --dest /payload
 
+FROM golang:1.25 AS api-kernel-build
+WORKDIR /build/api-kernel
+COPY api-kernel/ ./
+RUN CGO_ENABLED=0 go build -trimpath -o /out/kin-api-kernel ./cmd/kin-api-kernel
+
 FROM node:22-bookworm-slim
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates iptables iproute2 python3 \
@@ -40,6 +45,7 @@ COPY docker/kin-kvm ./docker/kin-kvm
 COPY --from=web /src/web/dist ./web/dist
 COPY --from=payload /payload/bin/ /opt/vm2api/image-bin/
 COPY --from=helpers /out/ /opt/vm2api/image-bin/
+COPY --from=api-kernel-build /out/kin-api-kernel /opt/vm2api/image-bin/
 COPY share/wrap-cli /opt/vm2api/image-wrap-cli
 COPY --from=payload /payload/share/wrap-cli/ /opt/vm2api/image-wrap-cli/
 COPY --from=payload /payload/share/crag/ /opt/vm2api/image-crag/

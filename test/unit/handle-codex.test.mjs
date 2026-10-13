@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { EventEmitter } from 'node:events'
 import {
   isRetryableCodexTransport,
   runCodexKernelHop,
@@ -402,7 +403,7 @@ test('nested Responses cached_tokens reaches the request log cache column', asyn
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('request log first_token_ms uses firstTokenAt minus injected ingress t0', async () => {
+test('request log first_token_ms uses hop ttftMs for a generated response', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-ttft-'))
   writeGptVm(root, 'vm-gpt-a')
   const res = {
@@ -438,17 +439,22 @@ test('request log first_token_ms uses firstTokenAt minus injected ingress t0', a
     ops: {
       writeCodexKernelConfig() {},
       ensureCodexKernel: async () => ({ ok: true }),
-      streamCodexKernel: async () => ({
-        ok: true,
-        status: 200,
-        terminalState: 'verified',
-        ttftMs: 300,
-        firstTokenAt: t0 + 1500,
-        usage: { input_tokens: 4, output_tokens: 1 },
-      }),
+      streamCodexKernel: async ({ onEvent }) => {
+        await onEvent('data: {"type":"response.output_text.delta","delta":"ok"}')
+        return {
+          ok: true,
+          status: 200,
+          terminalState: 'verified',
+          ttftMs: 300,
+          firstTokenAt: t0 + 1500,
+          usage: { input_tokens: 4, output_tokens: 1 },
+        }
+      },
     },
   })
-  assert.equal(logBag.first_token_ms, 1500)
+  // Codex hop accounting is hop-relative; firstTokenAt is retained by the
+  // transport for diagnostics but does not replace the reported hop TTFT.
+  assert.equal(logBag.first_token_ms, 300)
   fs.rmSync(root, { recursive: true, force: true })
 })
 
@@ -556,6 +562,119 @@ test('incomplete Responses stream still bills tokens from the completed event', 
   assert.equal(logBag.error_code, undefined)
   assert.equal(logBag.final_state, 'verified')
   assert.equal(stats.errors, 0)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('incomplete streamed hop emits a terminal failure event', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-incomplete-'))
+  writeGptVm(root, 'vm-gpt-a')
+  const writes = []
+  const res = {
+    headersSent: false,
+    write(chunk) {
+      this.headersSent = true
+      writes.push(String(chunk))
+    },
+    end() {
+      this.ended = true
+    },
+  }
+  const logBag = {}
+  const stats = { errors: 0, requests: 0, by_route: {} }
+  await handleCodexProtocol({
+    req: { headers: {} },
+    res,
+    protocol: 'openai.responses',
+    ctx: { body: { model: 'gpt-5.5', input: [], stream: true } },
+    inbound: { stream: true },
+    logBag,
+    stats,
+    json: (_res, status, body) => {
+      res.statusCode = status
+      res.body = body
+      return body
+    },
+    writeSSEHeaders() {
+      res.headersSent = true
+    },
+    routing: {},
+    projectRoot: root,
+    ops: {
+      writeCodexKernelConfig() {},
+      ensureCodexKernel: async () => ({ ok: true }),
+      streamCodexKernel: async ({ onEvent }) => {
+        await onEvent('data: {"type":"response.output_text.delta","delta":"partial"}')
+        return {
+          ok: false,
+          status: 200,
+          terminalState: 'incomplete',
+          committed: true,
+          body: { error: { code: 'codex_upstream', message: 'upstream stream closed' } },
+        }
+      },
+    },
+  })
+  assert.match(writes.join(''), /response\.failed/)
+  assert.equal(res.ended, true)
+  assert.equal(logBag.error_code, 'codex_upstream')
+  assert.equal(stats.errors, 1)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('a committed 200 stream with usage but no completed event is still incomplete', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-usage-without-complete-'))
+  writeGptVm(root, 'vm-gpt-a')
+  const res = {
+    headersSent: false,
+    write() {
+      this.headersSent = true
+    },
+    end() {
+      this.ended = true
+    },
+  }
+  const logBag = {}
+  const stats = { errors: 0, requests: 0, by_route: {} }
+  await handleCodexProtocol({
+    req: { headers: {} },
+    res,
+    protocol: 'openai.responses',
+    ctx: { body: { model: 'gpt-5.5', input: [], stream: true } },
+    inbound: { stream: true },
+    logBag,
+    stats,
+    json: (_res, status, body) => {
+      res.statusCode = status
+      res.body = body
+      return body
+    },
+    writeSSEHeaders() {
+      res.headersSent = true
+    },
+    routing: {},
+    projectRoot: root,
+    ops: {
+      writeCodexKernelConfig() {},
+      ensureCodexKernel: async () => ({ ok: true }),
+      streamCodexKernel: async ({ onEvent }) => {
+        await onEvent('data: {"type":"response.output_text.delta","delta":"partial"}')
+        return {
+          ok: false,
+          status: 200,
+          committed: true,
+          terminalState: 'incomplete',
+          usage: { input_tokens: 40, output_tokens: 2 },
+          body: { error: { code: 'codex_upstream', message: 'stream closed before completion' } },
+        }
+      },
+    },
+  })
+  assert.equal(logBag.input_tokens, 40)
+  assert.equal(logBag.output_tokens, 2)
+  assert.equal(logBag.final_state, 'incomplete')
+  assert.notEqual(logBag.final_state, 'verified')
+  assert.equal(stats.errors, 1)
+  assert.equal(res.ended, true)
   fs.rmSync(root, { recursive: true, force: true })
 })
 
@@ -1144,4 +1263,299 @@ test('tool argument disagreement terminates the client stream instead of recordi
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+const CREDENTIAL_BUSY = {
+  ok: false,
+  status: 503,
+  committed: false,
+  body: { error: { code: 'no_capacity', message: 'credential busy', type: 'api_error' } },
+}
+
+function setVmPolicy(root, id, policy) {
+  const file = path.join(root, 'vms', `${id}.json`)
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), policy }))
+}
+
+test('kernel credential busy moves the request to a free GPT slot instead of a 503', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-busy-'))
+  writeGptVm(root, 'vm-gpt-a')
+  writeGptVm(root, 'vm-gpt-b')
+  setVmPolicy(root, 'vm-gpt-a', { weight: 2 })
+  const hops = []
+  const args = codexArgs(root, {
+    ensureCodexKernel: async () => ({ ok: true }),
+    streamCodexKernel: async ({ exec, onEvent }) => {
+      hops.push(exec.vmId)
+      if (exec.vmId === 'vm-gpt-a') return CREDENTIAL_BUSY
+      await onEvent('data: {"type":"response.completed","response":{"id":"resp_b","status":"completed"}}')
+      return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp_b' } }
+    },
+  })
+  try {
+    const out = await handleCodexProtocol(args)
+    assert.equal(out.status, 200)
+    assert.deepEqual(hops, ['vm-gpt-a', 'vm-gpt-b'])
+    assert.ok(rt.openAIRuntimeSignals('vm-gpt-a').busyUntil > Date.now())
+    assert.equal(args.logBag.vm_id, 'vm-gpt-b')
+  } finally {
+    rt.resetOpenAIAccountRuntime()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a GPT slot whose kernel stays busy answers 429 with retry-after, not the kernel 503', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-busy-only-'))
+  writeGptVm(root, 'vm-gpt-a')
+  let hops = 0
+  const headers = {}
+  const args = codexArgs(root, {
+    ensureCodexKernel: async () => ({ ok: true }),
+    streamCodexKernel: async () => {
+      hops += 1
+      return CREDENTIAL_BUSY
+    },
+  })
+  args.res.setHeader = (name, value) => {
+    headers[name] = value
+  }
+  args.routing = { pool: { fallback_wait_timeout_ms: 1000 } }
+  const keepAlive = setTimeout(() => {}, 15_000)
+  try {
+    const out = await handleCodexProtocol(args)
+    assert.equal(out.status, 429)
+    assert.equal(out.body.error.code, 'pool_overloaded')
+    assert.ok(Number(headers['retry-after']) >= 1)
+    // The hold keeps the gateway from hammering a kernel that just said busy.
+    assert.equal(hops, 1)
+  } finally {
+    clearTimeout(keepAlive)
+    rt.resetOpenAIAccountRuntime()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('an uncommitted hop that ended under 200 still answers an error status', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-empty-'))
+  writeGptVm(root, 'vm-gpt-a')
+  const args = codexArgs(root, {
+    ensureCodexKernel: async () => ({ ok: true }),
+    streamCodexKernel: async () => ({
+      ok: false,
+      status: 200,
+      committed: false,
+      terminalState: 'incomplete',
+      body: { type: 'error', error: { type: 'api_error', code: 'empty_response', message: 'no output' } },
+    }),
+  })
+  try {
+    const out = await handleCodexProtocol(args)
+    assert.equal(out.status, 502)
+    assert.equal(out.body.error.code, 'empty_response')
+  } finally {
+    rt.resetOpenAIAccountRuntime()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+const SERVER_ERROR = {
+  ok: false,
+  status: 502,
+  committed: false,
+  terminalState: 'incomplete',
+  ttftMs: 518,
+  body: { type: 'error', error: { type: 'server_error', code: 'server_error', message: 'processing request failed' } },
+  streamDiagnostics: { events: 5, last_event: 'error', terminal: 'error', committed: false },
+}
+
+async function serverErrorArgs(t, hop, extras = {}) {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-server-error-'))
+  t.after(() => {
+    rt.resetOpenAIAccountRuntime()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  writeGptVm(root, 'vm-gpt-a')
+  writeGptVm(root, 'vm-gpt-b')
+  setVmPolicy(root, 'vm-gpt-a', { weight: 2 })
+  return codexArgs(root, { ensureCodexKernel: async () => ({ ok: true }), streamCodexKernel: hop }, extras)
+}
+
+test('precommit server_error moves to a different account and records both hops', async (t) => {
+  const seen = []
+  const args = await serverErrorArgs(t, async ({ exec }) => {
+    seen.push(exec.vmId)
+    if (seen.length === 1) return { ...SERVER_ERROR }
+    return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp_recovered' } }
+  })
+  const out = await handleCodexProtocol(args)
+  assert.equal(out.status, 200)
+  assert.equal(out.body.id, 'resp_recovered')
+  assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-b'])
+  assert.equal(args.logBag.attempt_count, 2)
+  assert.equal(args.logBag.codex_failed_over, true)
+  assert.equal(args.logBag.final_state, 'verified')
+  assert.equal(args.logBag.error_code, undefined)
+  assert.equal(args.logBag.error_message, undefined)
+  assert.equal(args.logBag.transport_retried, undefined)
+  assert.deepEqual(
+    args.logBag.hop_meta.codex_attempts.map((h) => h.error_code),
+    ['server_error', null],
+  )
+  assert.equal(args.logBag.hop_meta.codex_attempts[0].stream.committed, false)
+})
+
+test('exhausted server_error failover preserves the last provider error without replaying an account', async (t) => {
+  const seen = []
+  const args = await serverErrorArgs(t, async ({ exec }) => {
+    seen.push(exec.vmId)
+    return { ...SERVER_ERROR }
+  })
+  const out = await handleCodexProtocol(args)
+  assert.equal(out.status, 502)
+  assert.deepEqual(out.body, SERVER_ERROR.body)
+  assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-b'])
+  assert.equal(args.logBag.attempt_count, 2)
+  assert.equal(args.logBag.final_state, 'incomplete')
+  assert.equal(args.logBag.error_code, 'server_error')
+  assert.equal(args.logBag.transport_retried, undefined)
+})
+
+test('a pinned VM keeps a precommit server_error on that account', async (t) => {
+  const seen = []
+  const args = await serverErrorArgs(
+    t,
+    async ({ exec }) => {
+      seen.push(exec.vmId)
+      return { ...SERVER_ERROR }
+    },
+    { headers: { 'x-kin-vm': 'vm-gpt-a' } },
+  )
+  args.req.apiKeyKind = 'master'
+  const out = await handleCodexProtocol(args)
+  assert.equal(out.status, 502)
+  assert.deepEqual(seen, ['vm-gpt-a'])
+  assert.equal(args.logBag.attempt_count, 1)
+})
+
+for (const [status, code] of [
+  [400, 'server_error'],
+  [502, 'context_length_exceeded'],
+  [502, 'content_policy_violation'],
+]) {
+  test(`${status} ${code} does not add account replay`, async (t) => {
+    const seen = []
+    const args = await serverErrorArgs(t, async ({ exec }) => {
+      seen.push(exec.vmId)
+      return { ...SERVER_ERROR, status, body: { error: { code, message: 'request rejected' } } }
+    })
+    const out = await handleCodexProtocol(args)
+    assert.equal(out.status, status)
+    assert.equal(out.body.error.code, code)
+    assert.deepEqual(seen, ['vm-gpt-a'])
+  })
+}
+
+for (const type of ['response.output_text.delta', 'response.failed', 'response.incomplete']) {
+  test(`server_error after committed ${type} does not replay`, async (t) => {
+    const seen = []
+    const writes = []
+    const args = await serverErrorArgs(
+      t,
+      async ({ exec, onEvent }) => {
+        seen.push(exec.vmId)
+        await onEvent(
+          `data: ${JSON.stringify({ type, delta: 'partial', response: { id: 'resp_partial', status: 'failed' } })}`,
+        )
+        return { ...SERVER_ERROR, status: 200, committed: true }
+      },
+      { body: { model: 'gpt-5.5', input: 'hi', stream: true } },
+    )
+    args.inbound.stream = true
+    args.writeSSEHeaders = () => {
+      args.res.headersSent = true
+    }
+    args.res.write = (chunk) => writes.push(String(chunk))
+    await handleCodexProtocol(args)
+    assert.deepEqual(seen, ['vm-gpt-a'])
+    assert.equal(args.logBag.attempt_count, 1)
+    assert.equal(args.logBag.error_code, 'server_error')
+    assert.equal(args.logBag.final_state, 'incomplete')
+    const failures = writes.filter((line) => line.includes('"type":"response.failed"'))
+    assert.equal(failures.length, type === 'response.incomplete' ? 0 : 1)
+  })
+}
+
+test('client cancellation does not replay a precommit server_error', async (t) => {
+  const seen = []
+  let args
+  args = await serverErrorArgs(t, async ({ exec }) => {
+    seen.push(exec.vmId)
+    args.req.emit('aborted')
+    return { ...SERVER_ERROR }
+  })
+  args.req = Object.assign(new EventEmitter(), args.req)
+  const out = await handleCodexProtocol(args)
+  assert.equal(out, undefined)
+  assert.deepEqual(seen, ['vm-gpt-a'])
+  assert.equal(args.logBag.final_state, 'cancelled')
+})
+
+for (const code of ['server_error', 'usage_limit_reached', 'upstream_transport']) {
+  test(`previous_response_id preserves its account binding after ${code}`, async (t) => {
+    const seen = []
+    const sessionKey = 'stored-response-session'
+    let binding = { accountId: 'vm-gpt-a', vmId: 'vm-gpt-a', sessionId: sessionKey }
+    const args = await serverErrorArgs(
+      t,
+      async ({ exec }) => {
+        seen.push(exec.vmId)
+        return { ...SERVER_ERROR, body: { error: { code, message: 'continuation failed' } } }
+      },
+      {
+        body: { model: 'gpt-5.5', input: 'continue', previous_response_id: 'resp_stored', stream: false },
+        stickyRouter: {
+          collectPoolKeys: () => [sessionKey],
+          extractPoolKey: () => sessionKey,
+          resolve: () => binding,
+          bind: (_key, value) => {
+            binding = value
+          },
+          unbind: () => {
+            binding = null
+          },
+        },
+      },
+    )
+    const out = await handleCodexProtocol(args)
+    assert.equal(out.status, 502)
+    assert.equal(out.body.error.code, code)
+    assert.ok(seen.length >= 1)
+    assert.ok(seen.every((id) => id === 'vm-gpt-a'))
+    assert.equal(binding?.vmId, 'vm-gpt-a')
+    if (code !== 'upstream_transport') assert.equal(seen.length, 1)
+  })
+}
+
+test('previous_response_id without a known binding does not replay on a second account', async (t) => {
+  const seen = []
+  const args = await serverErrorArgs(
+    t,
+    async ({ exec }) => {
+      seen.push(exec.vmId)
+      return { ...SERVER_ERROR }
+    },
+    { body: { model: 'gpt-5.5', input: 'continue', previous_response_id: 'resp_stored', stream: false } },
+  )
+  const out = await handleCodexProtocol(args)
+  assert.equal(out.status, 502)
+  assert.deepEqual(seen, ['vm-gpt-a'])
+  assert.equal(args.logBag.attempt_count, 1)
 })

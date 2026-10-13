@@ -622,7 +622,6 @@ function classifyUpstreamResultRaw(
         reason: 'provider_timeout',
       })
     }
-
     // A 2xx stream that died before visible output used to be rewritten to 502.
     // Kernel may also send that 502 with terminal incomplete. Neither is overload.
     if (result.terminalState === 'incomplete' && !result.committed && !/overload/i.test(message)) {

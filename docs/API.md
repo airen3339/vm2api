@@ -235,7 +235,9 @@ curl -sS http://127.0.0.1:8787/health
 | `upstream_error` | 401/403/502 |
 | `api_error` | 500 |
 
-上游 429 失败转移用尽后原样返回 429 `upstream_rate_limit`，有上游 `retry-after` 时透传；529 一定带 `retry-after`（号池估计，上游 529 取上游值，都没有时为 1）。恢复备份期间协议口 `503 restore_in_progress`。健康探测短请求在无缓存且 fail-closed 时 `503`。Claude Code Usage Policy `API Error`（含内核报成 400 的）不换号、不修复重试，客户端收到 503 `refusal_guard`，并把该 prompt 永久写入拒答缓存；再次相同请求，或用户正文与已缓存正文的估计 Jaccard 达到面板阈值（默认 0.90，可选 0.80/0.85/0.90/0.95），都在 hop 前被拦。`content_policy`、`cyber_policy`、`moderation_blocked` 等内容错误码同样入库。协议硬正则，或面板所选的 Jev / Laya / ModernBERT（`/v1/systemone`，`noul ≥ 0.5`）判为 NSFW、蒸馏、破解、破限时返回 403 `policy_blocked`，不 hop，并在拒答守卫开启时入库、可封禁 device。近似和 device 封禁可在面板关闭。拒答命中在 device 封禁开启时还会永久封禁该入站 device id。
+上游 429 失败转移用尽后原样返回 429 `upstream_rate_limit`，有上游 `retry-after` 时透传；529 一定带 `retry-after`（号池估计，上游 529 取上游值，都没有时为 1）。恢复备份期间协议口 `503 restore_in_progress`。健康探测短请求在无缓存且 fail-closed 时 `503`。Claude Code Usage Policy `API Error`（含内核报成 400 的）不换号、不修复重试，客户端收到 403 `permission_error` / `refusal_guard`，`details.blocked_by=upstream`、`details.retryable=false`，响应头 `x-should-retry: false`，并把该 prompt 永久写入拒答缓存；再次相同请求，或用户正文与已缓存正文的估计 Jaccard 达到面板阈值（默认 0.90，可选 0.80/0.85/0.90/0.95），都在 hop 前被拦。`content_policy`、`cyber_policy`、`moderation_blocked` 等内容错误码同样入库。近似和 device 封禁可在面板关闭。拒答命中在 device 封禁开启时还会永久封禁该入站 device id。
+
+本地非蒸馏硬正则或 Jev / Laya / ModernBERT 决策模型拦截返回 400 `invalid_request_error` / `policy_blocked`，响应带 `details.blocked_by`、`details.retryable=false` 和 `x-should-retry: false`。这种错误要求调整请求内容，避免 Claude Code 将本地内容拦截识别为需要 `/login` 的鉴权失败；真正的鉴权错误及上游拒答保留原状态。硬正则和决策模型仅扫描当前及历史的直接用户文本，排除 `tool_result`、工具输出和 assistant / system 内容，仍保留 reminder 过滤及按需 base64 展开。它们不选槽、不 hop，也不写入拒答缓存。蒸馏拦截继续使用蒸馏关配置的状态码（默认 403）。
 
 号池结果分开返回，不互相伪装：
 

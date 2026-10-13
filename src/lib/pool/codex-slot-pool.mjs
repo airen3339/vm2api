@@ -153,24 +153,46 @@ export function codexAccountStatus(vm, now = Date.now(), policy = null) {
   return 'normal'
 }
 
+/** listVms() hands out summaries (`max_concurrency`); getVm() hands out raw records (`policy`). */
+function policyNumber(vm, summaryKey, policyKey) {
+  const raw = vm?.[summaryKey] ?? vm?.policy?.[policyKey]
+  if (raw == null || raw === '') return null
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : null
+}
+
 /** Panel allowlist on a GPT slot. No model or no list means allowed. */
 export function codexSlotAllowsModel(vm, model) {
   if (!model) return true
   return modelMatchesAllowlist(model, vm?.allowed_models ?? vm?.policy?.allowed_models)
 }
 
+/** The kernel enforces the credential's own RPM; admit no faster than the tighter limit. */
+function effectiveCodexRpm(vm) {
+  const limits = [policyNumber(vm, 'max_rpm', 'maxRpm'), Number(vm?.codex_account_rpm)].filter((n) => n > 0)
+  return limits.length ? Math.min(...limits) : 0
+}
+
 export function codexAccountCandidate(vm, now = Date.now(), signals = null, policy = null) {
   const runtime = signals || openAIRuntimeSignals(vm?.id, now)
   const effective = effectiveOpenAIPolicy(vm, normalizeOpenAIQuotaPolicy(policy))
+  const credentialRpm = effectiveCodexRpm(vm)
+  const rawConcurrency = vm?.policy?.maxConcurrency ?? vm?.max_concurrency
+  const concurrencyOverride =
+    vm?.policy?.concurrencyOverride ?? vm?.concurrency_override ?? vm?.max_concurrency_override
+  const explicitUnlimited = Number.isInteger(rawConcurrency) && rawConcurrency === 0 && concurrencyOverride !== false
   return {
     id: vm.id,
     weight: Number(vm?.policy?.weight ?? vm?.weight ?? 1) || 1,
-    concurrency: effective.max_concurrency,
-    maxRpm: effective.max_rpm,
+    concurrency: explicitUnlimited ? Number.MAX_SAFE_INTEGER : effective.max_concurrency,
+    maxRpm: [effective.max_rpm, credentialRpm].filter((n) => n > 0).length
+      ? Math.min(...[effective.max_rpm, credentialRpm].filter((n) => n > 0))
+      : 0,
     maxSessions: effective.max_sessions,
     rpmCount: runtime.rpmCount || 0,
     rpmResetAt: runtime.rpmResetAt ?? null,
     status: codexAccountStatus(vm, now, policy),
+    busyUntil: runtime.busyUntil ?? null,
     inFlight: runtime.inFlight || 0,
     lastStartedAt: runtime.lastStartedAt ?? null,
     quotaResetAt: quotaResetAt(vm),
@@ -256,7 +278,7 @@ export function orderCodexSessionSlots(
     const quotaExhausted = statuses.length > 0 && statuses.every((status) => status === 'quota_exhausted')
     return {
       error: quotaExhausted ? 'quota_exhausted' : 'capacity_unavailable',
-      retryAt: quotaExhausted ? null : rpmRetryAt(candidates, now),
+      retryAt: quotaExhausted ? null : capacityRetryAt(candidates, now),
       ids: [],
       ready: [],
       parked: picked.parked || [],
@@ -287,12 +309,21 @@ export function codexMaxSessions(vm, policy = null) {
   return n > 0 ? Math.round(n) : 0
 }
 
-/** Earliest RPM window opening among normal slots capped only by RPM. */
-function rpmRetryAt(candidates, now) {
-  const times = candidates
-    .filter((c) => c.status === 'normal' && c.maxRpm > 0 && c.rpmCount >= c.maxRpm && c.inFlight < c.concurrency)
-    .map((c) => Number(c.rpmResetAt))
-    .filter((t) => Number.isFinite(t) && t > now)
+/**
+ * Earliest moment a normal slot with a free seat reopens: its RPM window
+ * frees a start, or the hold after its kernel answered `no_capacity` ends.
+ * Slots that are full on concurrency wake waiters on release instead.
+ */
+function capacityRetryAt(candidates, now) {
+  const times = []
+  for (const c of candidates) {
+    if (c.status !== 'normal' || c.inFlight >= c.concurrency) continue
+    const busyUntil = Number(c.busyUntil)
+    const busy = Number.isFinite(busyUntil) && busyUntil > now
+    const rpmResetAt = Number(c.rpmResetAt)
+    const rpmFull = c.maxRpm > 0 && c.rpmCount >= c.maxRpm && Number.isFinite(rpmResetAt) && rpmResetAt > now
+    if (busy || rpmFull) times.push(Math.max(busy ? busyUntil : 0, rpmFull ? rpmResetAt : 0))
+  }
   return times.length ? Math.min(...times) : null
 }
 
@@ -314,6 +345,10 @@ export function isCodexFailoverError(result) {
   const status = Number(result.status) || 0
   const code = String(result.body?.error?.code || result.error_code || '')
   if (status === 429 || status === 401 || status === 403) return true
+  if (status >= 500 && status < 600 && code === 'server_error') return true
+  // Responses SSE can close after downstream buffering has kept headers
+  // uncommitted. Rotate before exposing the incomplete stream to the client.
+  if (!result.committed && (code === 'codex_upstream' || code === 'server_is_overloaded')) return true
   return /usage_limit_reached|upstream_auth|no_credential|sticky_unavailable/.test(code)
 }
 

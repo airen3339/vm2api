@@ -35,6 +35,7 @@ import {
 } from './codex-models.mjs'
 import { orderCodexSessionSlots, codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
 import {
+  markOpenAISlotBusy,
   reportOpenAIAttempt,
   tryAcquireOpenAISlot,
   waitForOpenAICapacity,
@@ -156,10 +157,10 @@ function pinnedVmId(req) {
 export function pickCodexCandidates(
   projectRoot,
   req,
-  { stickyRouter = null, sessions = null, body = null, excluded = null, routing = {} } = {},
+  { stickyRouter = null, sessions = null, body = null, model = null, excluded = null, routing = {} } = {},
 ) {
   const pin = pinnedVmId(req)
-  const model = body?.model || null
+  const requestedModel = String(model || body?.model || '').trim()
   const routingPolicy = normalizeCodexRouting(routing.codex || routing).quota
   const scope = keyScopeFromRequest(req)
   const poolDenial = vmPoolDenial(scope)
@@ -169,7 +170,7 @@ export function pickCodexCandidates(
     const vm = getVm(projectRoot, pin)
     if (!vm || !isCodexVm(vm)) return { error: 'platform_mismatch', pin, ids: [] }
     if (!keyAllowsVm(scope, vm)) return { error: 'key_group_mismatch', pin, ids: [] }
-    if (!codexSlotAllowsModel(vm, model)) return { error: 'model_not_allowed', pin, ids: [] }
+    if (!codexSlotAllowsModel(vm, requestedModel)) return { error: 'model_not_allowed', pin, ids: [] }
     const ordered = orderCodexSessionSlots([vm], {
       pin,
       excluded,
@@ -187,6 +188,10 @@ export function pickCodexCandidates(
   const sessionKey = stickyRouter?.extractPoolKey?.(req, body || {}, { platform: 'openai' }) || stickyKeys[0] || null
   const bound = sessionKey ? stickyRouter?.resolve?.(sessionKey) : null
   const vms = listVms(projectRoot, { codex: { quota: routingPolicy } }).filter((vm) => keyAllowsVm(scope, vm))
+  const codexVms = vms.filter(isCodexVm)
+  if (requestedModel && codexVms.length && !codexVms.some((vm) => codexSlotAllowsModel(vm, requestedModel))) {
+    return { error: 'model_not_allowed', ids: [], sessionKey, stickyKeys }
+  }
   const continuesResponse = !!body?.previous_response_id && !!bound?.vmId
   if (scope.vm_pool_id && vms.length === 0 && !continuesResponse) {
     return { error: 'vm_pool_unavailable', message: '账号池没有可调度的 GPT 槽位', ids: [], candidates: [] }
@@ -195,7 +200,7 @@ export function pickCodexCandidates(
     boundVmId: bound?.vmId || null,
     sessionKey,
     sessionLimit: sessions,
-    model,
+    model: requestedModel,
     excluded,
     quotaPolicy: routingPolicy,
   })
@@ -246,6 +251,18 @@ export function isRetryableCodexTransport(result) {
   return /upstream_transport|worker_transport_error/i.test(code)
 }
 
+/**
+ * The kernel answers 503 `no_capacity` ("credential busy") when the account's
+ * own RPM window is full. Nothing ran upstream: the request waits for a seat
+ * instead of handing the client a 503 it would burn its retries on.
+ */
+export function isCodexCapacityRejection(result) {
+  if (!result || result.ok === true || result.committed === true) return false
+  if (Number(result.status) !== 503) return false
+  const code = String(result.body?.error?.code || '')
+  return code === 'no_capacity' || /credential busy/i.test(String(result.body?.error?.message || ''))
+}
+
 /** Idle SOCKS / first hop 502 is retryable only before any SSE byte is committed. */
 /** `response.service_tier` from a Responses SSE data line, if present. */
 export function serviceTierFromSseLine(line) {
@@ -287,9 +304,40 @@ function preferUsage(left, right) {
   return left || right || null
 }
 
+function writeIncompleteCodexStream(res, protocol, result, model, responseId = null) {
+  if (!res || res.destroyed || res.writableEnded) return
+  const source = result?.body?.error || result?.body || {}
+  const code = String(source.code || 'codex_upstream').slice(0, 120)
+  const message = String(source.message || 'Codex upstream stream ended before completion').slice(0, 500)
+  if (protocol === 'openai.responses') {
+    res.write(
+      `data: ${JSON.stringify({
+        type: 'response.failed',
+        response: {
+          id: result?.body?.id || responseId || `resp_incomplete_${Date.now()}`,
+          object: 'response',
+          model,
+          status: 'failed',
+          output: [],
+          error: { code, message },
+        },
+      })}\n\n`,
+    )
+    return
+  }
+  if (protocol === 'openai.chat' || protocol === 'openai.completions') {
+    res.write(`data: ${JSON.stringify({ error: { type: 'server_error', code, message } })}\n\ndata: [DONE]\n\n`)
+    return
+  }
+  if (protocol === 'anthropic.messages') {
+    res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message } })}\n\n`)
+  }
+}
+
 const WAIT_TIMEOUT_MIN_MS = 1000
 const WAIT_TIMEOUT_MAX_MS = 120000
 const DEFAULT_WAIT_TIMEOUT_MS = 30000
+const CODEX_TERMINAL_EVENTS = new Set(['response.completed', 'response.failed', 'response.incomplete', 'response.done'])
 
 /** Same knob and clamp as the Claude pool's fallback wait. */
 function codexWaitTimeoutMs(routing) {
@@ -507,6 +555,7 @@ export async function handleCodexProtocol({
     body: body || converted.body || inbound,
     excluded: new Set(),
     routing,
+    model: converted.body.model,
   }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
@@ -515,6 +564,7 @@ export async function handleCodexProtocol({
   let last = null
   let hops = 0
   let counted = false
+  const codexAttempts = []
   try {
     for (;;) {
       const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, { deadline, signal: gone.signal })
@@ -524,8 +574,9 @@ export async function handleCodexProtocol({
           logBag.final_state = 'cancelled'
           return
         }
-        // Real upstream failures already happened: report the last one, not the pool.
-        if (last) break
+        // Real upstream failures already happened: report the last one, not the
+        // pool. A kernel that was only full is a pool answer: 429 + retry-after.
+        if (last && !isCodexCapacityRejection(last)) break
         return rejectCodexAdmission({ res, json, stats, logBag, picked, model: converted.body?.model })
       }
       const vm = getVm(projectRoot, admitted.vmId)
@@ -597,6 +648,10 @@ export async function handleCodexProtocol({
         logBag.attempt_count = hops
         const chunks = []
         const nameSseEvent = createResponsesSseEventNamer()
+        let streamTerminal = false
+        let streamCompleted = false
+        let streamFailed = false
+        let responseId = null
         let responseServiceTier = null
         let streamedUsage = null
         let conversionError = null
@@ -634,6 +689,7 @@ export async function handleCodexProtocol({
             signal: gone.signal,
             body: outboundBody,
             reqHeaders: req.headers,
+            signal: gone.signal,
             envelope: {
               body: outboundBody,
               headers: outboundHeaders,
@@ -645,6 +701,18 @@ export async function handleCodexProtocol({
             if (captureOutbound) logBag.outbound_body = retryBody
           },
           onEvent: async (line) => {
+            if (conversionError) return
+            if (line.startsWith('data:')) {
+              try {
+                const event = JSON.parse(line.slice(5).trim())
+                const type = event?.type
+                if (event?.response?.id) responseId = event.response.id
+                if (CODEX_TERMINAL_EVENTS.has(type)) streamTerminal = true
+                const status = event?.response?.status
+                if (type === 'response.completed' && (!status || status === 'completed')) streamCompleted = true
+                else if (type === 'error' || CODEX_TERMINAL_EVENTS.has(type)) streamFailed = true
+              } catch {}
+            }
             if (conversionError) return
             const tier = serviceTierFromSseLine(line)
             if (tier) responseServiceTier = tier
@@ -696,9 +764,38 @@ export async function handleCodexProtocol({
         last = result
         const hopUsage = result.usage || result.body?.usage || result.body?.response?.usage || null
         const usage = preferUsage(hopUsage, streamedUsage)
-        // Responses SSE is not a Claude assistant message, so the stream client
-        // reports ok:false / incomplete. A 200 hop that carried tokens still billed.
-        const delivered = !conversionError && (result?.ok || (Number(result?.status) === 200 && usageTokens(usage) > 0))
+        const extracted = extractOpenaiUsage(usage)
+        const serviceTier = responseServiceTier || converted.body?.service_tier || usage?.service_tier || null
+        // Partial responses may still be billed; usage is independent of delivery.
+        logBag.usage = usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage
+        logBag.input_tokens = extracted?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
+        logBag.output_tokens = extracted?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
+        logBag.cache_read_tokens =
+          extracted?.cached_tokens ?? usage?.input_tokens_details?.cached_tokens ?? usage?.cache_read_tokens ?? null
+        logBag.cache_creation_tokens =
+          extracted?.cache_write_tokens ??
+          usage?.input_tokens_details?.cache_write_tokens ??
+          usage?.cache_creation_tokens ??
+          null
+        logBag.first_token_ms = result.ttftMs ?? null
+        logBag.upstream_model = converted.body.model
+        logBag.stop_reason = result.stopReason || result.body?.incomplete_details?.reason || null
+        codexAttempts.push({
+          vm_id: vm.id,
+          upstream_status: result.upstreamStatus ?? result.status ?? 0,
+          terminal_state: result.terminalState || null,
+          error_code: result.body?.error?.code || null,
+          transport_retried: result.transport_retried === true,
+          stream: result.streamDiagnostics || null,
+        })
+        logBag.hop_meta = { ...(logBag.hop_meta || {}), via: 'codex-kernel', codex_attempts: codexAttempts }
+        logBag.upstream_status = result.upstreamStatus ?? result.status ?? 0
+        if (gone.signal.aborted || result.terminalState === 'cancelled') {
+          logBag.final_state = 'cancelled'
+          return
+        }
+        // The client already holds `response.completed`: that response was delivered.
+        const delivered = !conversionError && (result?.ok === true || (streamCompleted && !streamFailed))
         if (delivered) {
           attemptKind = 'succeeded'
           bindSticky(outboundSessionId)
@@ -715,8 +812,7 @@ export async function handleCodexProtocol({
             usage?.cache_creation_tokens ??
             null
           reportOpenAIAttempt(vm.id, 'succeeded', result.ttftMs ?? null)
-          logBag.final_state = result?.ok ? result.terminalState || 'verified' : 'verified'
-          logBag.upstream_model = converted.body.model
+          logBag.final_state = result.ok === true ? result.terminalState || 'verified' : 'verified'
           if (hops > 1) logBag.codex_failed_over = true
           if (!stream) {
             let body
@@ -740,16 +836,33 @@ export async function handleCodexProtocol({
           if (!res.headersSent) writeSSEHeaders(res)
           return res.end()
         }
+        if (!res.headersSent && isCodexCapacityRejection(result)) {
+          // The slot stays a candidate: hold it until its RPM window can take
+          // another request, then this request is admitted again.
+          reportOpenAIAttempt(vm.id, 'capacity_rejected')
+          markOpenAISlotBusy(vm.id)
+          continue
+        }
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
+        logBag.final_state = result.terminalState || 'incomplete'
+        logBag.error_code = result?.body?.error?.code || 'codex_upstream'
+        logBag.error_message = String(
+          result?.body?.error?.message || 'Codex upstream stream ended before completion',
+        ).slice(0, 300)
         if (res.headersSent) {
           stats.errors++
-          logBag.error_code = result?.body?.error?.code || 'codex_upstream'
-          logBag.upstream_status = result?.status || 0
+          if (stream && !streamTerminal) {
+            writeIncompleteCodexStream(res, protocol, result, converted.body.model, responseId)
+          }
           return res.end()
         }
-        if (isCodexFailoverError(result)) {
+        if (isCodexFailoverError(result) || isRetryableCodexTransport(result)) {
+          // Stored response continuations cannot move accounts or lose their binding.
+          if (inboundSession.previous_response_id) break
           pickOpts.excluded.add(vm.id)
           leaveSticky()
+          delete logBag.error_code
+          delete logBag.error_message
           continue
         }
         break
@@ -767,8 +880,21 @@ export async function handleCodexProtocol({
   }
   stats.errors++
   logBag.error_code = last?.body?.error?.code || 'codex_upstream'
-  logBag.upstream_status = last?.status || 0
-  return json(res, last?.status || 502, last?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
+  logBag.error_message = String(last?.body?.error?.message || 'Codex upstream stream ended before completion').slice(
+    0,
+    300,
+  )
+  logBag.final_state = last?.terminalState || 'incomplete'
+  logBag.upstream_status = last?.upstreamStatus ?? last?.status ?? 0
+  // A hop that ended without its terminal event is an error, whatever status it streamed under.
+  const status = Number(last?.status) >= 400 ? Number(last.status) : 502
+  return json(
+    res,
+    status,
+    last?.body || {
+      error: { type: 'api_error', code: 'codex_upstream', message: 'Codex upstream stream ended before completion' },
+    },
+  )
 }
 
 /** No seat was admitted and nothing ran: say which gate stopped the request. */

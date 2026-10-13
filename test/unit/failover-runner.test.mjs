@@ -44,6 +44,47 @@ class Attempts {
   }
 }
 
+test('CLI request refusal does not cool down or rotate the account for subsequent Opus requests', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  let calls = 0
+  const refused = await runner.run({
+    requestId: 'request-policy-refusal',
+    canonicalBody: { model: 'claude-sonnet-5-5' },
+    model: 'claude-sonnet-5-5',
+    callAttempt: () => {
+      calls++
+      return {
+        ok: false,
+        status: 502,
+        terminalState: 'incomplete',
+        body: {
+          error: {
+            message: 'Claude Code is unable to respond to this request, which appears to violate our Usage Policy',
+          },
+        },
+      }
+    },
+  })
+  assert.equal(calls, 1)
+  assert.equal(refused.ok, false)
+  assert.equal(refused.status, 502)
+  assert.equal(refused.finalState, 'rejected')
+  assert.equal(refused.policy.rememberRefusal, true)
+  assert.equal(refused.policy.cooldownUntil, null)
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.deepEqual(scheduler.successes, [])
+  const next = await runner.run({
+    requestId: 'normal-opus-after-refusal',
+    canonicalBody: { model: 'claude-opus-5-5' },
+    model: 'claude-opus-5-5',
+    callAttempt: () => success(),
+  })
+  assert.equal(next.ok, true)
+  assert.equal(next.accountId, 'account-1')
+  assert.deepEqual(scheduler.cooldowns, [])
+})
+
 function candidate(number) {
   return {
     vmId: `vm-0${number}`,

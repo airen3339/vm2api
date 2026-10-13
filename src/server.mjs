@@ -21,7 +21,8 @@ import {
   getPanelAdmin,
 } from './lib/core/security.mjs'
 import { loadModelPolicy } from './lib/protocol/model-policy.mjs'
-import { gatewayModelCatalog } from './lib/protocol/models.mjs'
+import { gatewayModelCatalog, nativeCodexModelCatalog } from './lib/protocol/models.mjs'
+import { normalizeCodexCatalogVersion } from './lib/protocol/codex-models.mjs'
 import {
   createCredentialRefreshMonitor,
   normalizeCredentialRefreshConfig,
@@ -87,10 +88,12 @@ import {
   mirrorWorkerCredentialsToVm,
 } from './lib/oauth/oauth-credentials.mjs'
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
-import { ensureWorkerCredential } from './lib/transport/go-worker-client.mjs'
+import { ensureWorkerCredential, waitExistingCredentialRefreshes } from './lib/transport/go-worker-client.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { isConsoleEntry, tryServeWebDist } from './lib/http/web-dist.mjs'
+import { createGracefulShutdown } from './lib/http/graceful-shutdown.mjs'
+import { openAIRuntimeSignals, openAIWaiterCount } from './lib/pool/openai-account-runtime.mjs'
 import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
 import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
@@ -912,6 +915,8 @@ const handlePanel = createPanelHandler({
 })
 
 const server = http.createServer(async (req, res) => {
+  const releaseRequest = shutdownController.admitRequest(req, res)
+  if (!releaseRequest) return
   try {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
@@ -1010,7 +1015,31 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && p === '/v1/models') {
       if (!requireAuth(req, res)) return
-      if (resolveInferenceBackend(req) === 'api') {
+      const backend = resolveInferenceBackend(req)
+      const clientVersion = new URL(req.url || '', 'http://127.0.0.1').searchParams.get('client_version')
+      if (clientVersion && normalizeCodexCatalogVersion(clientVersion)) {
+        if (backend === 'api') {
+          return json(res, 503, {
+            error: {
+              type: 'server_error',
+              code: 'codex_catalog_unavailable',
+              message: 'Native Codex model metadata is unavailable for the API-only backend.',
+            },
+          })
+        }
+        const nativeCatalog = nativeCodexModelCatalog()
+        if (!nativeCatalog) {
+          return json(res, 503, {
+            error: {
+              type: 'server_error',
+              code: 'codex_catalog_unavailable',
+              message: 'Native Codex model metadata is unavailable; refresh the live Codex catalog.',
+            },
+          })
+        }
+        return json(res, 200, nativeCatalog)
+      }
+      if (backend === 'api') {
         return json(res, 200, apiScheduler.catalog())
       }
       const result = await fetchWorkerModels({ groupType: keyScopeFromRequest(req).group_type })
@@ -1070,10 +1099,13 @@ const server = http.createServer(async (req, res) => {
         res.end()
       } catch {}
     }
+  } finally {
+    releaseRequest()
   }
 })
 
 server.on('upgrade', (req, socket, head) => {
+  if (!shutdownController.admitUpgrade(req, socket)) return
   if (clusterRoutes.handleUpgrade(req, socket, head)) return
   if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
 })
@@ -1124,58 +1156,82 @@ fs.writeFileSync(path.join(cfg.paths.root, 'config', 'gateway-v2.public.json'), 
 process.on('uncaughtException', (e) => console.error('[uncaught]', e))
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
 
-// Graceful shutdown: stop schedulers/watchers, close the DB (WAL checkpoint).
-let _shuttingDown = false
-function shutdown(signal) {
-  if (_shuttingDown) return
-  _shuttingDown = true
-  console.log(`[shutdown] ${signal} — closing`)
-  try {
-    backupService.stopScheduler()
-  } catch {}
-  try {
-    proxyPool.stopScheduler()
-  } catch {}
-  try {
-    healthMonitor?.stop?.()
-  } catch {}
-  try {
-    credentialRefreshMonitor?.stop?.()
-  } catch {}
-  try {
-    kernelWatchdog?.stop?.()
-  } catch {}
-  try {
-    cliNodeGuard?.stop?.()
-  } catch {}
-  try {
-    usageProbeMonitor?.stop?.()
-  } catch {}
-
-  try {
-    notifyMonitor?.stop?.()
-  } catch {}
-  try {
-    stopVmWatch()
-  } catch {}
-  try {
-    stopAllRustKernels()
-  } catch {}
-  try {
-    clusterManager.stop()
-  } catch {}
-  try {
-    server.close(() => {})
-  } catch {}
-  try {
-    closeDatabase()
-  } catch {}
-  process.exit(0)
+const stopBackgroundSchedulers = () => {
+  const failures = []
+  for (const stop of [
+    () => backupService.stopScheduler(),
+    () => proxyPool.stopScheduler(),
+    () => requestLog.stopCleanupScheduler(),
+    () => healthMonitor?.stop?.(),
+    () => credentialRefreshMonitor?.stop?.(),
+    () => kernelWatchdog?.stop?.(),
+    () => cliNodeGuard?.stop?.(),
+    () => usageProbeMonitor?.stop?.(),
+    () => notifyMonitor?.stop?.(),
+  ]) {
+    try {
+      stop()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  if (failures.length) throw new AggregateError(failures, 'Failed to pause background schedulers')
 }
-process.on('SIGTERM', () => shutdown('SIGTERM'))
-process.on('SIGINT', () => shutdown('SIGINT'))
+
+// Keep request logging, pools and worker refreshes alive until admitted work
+// finishes. Existing shell/control WebSockets must close naturally as well.
+const shutdownController = createGracefulShutdown({
+  server,
+  stopBackground: (signal) => {
+    console.log(`[shutdown] ${signal} — draining admitted requests`)
+    stopBackgroundSchedulers()
+  },
+  readPoolState: () => ({
+    claudeInFlight: poolScheduler ? [...poolScheduler.inflight.values()].reduce((sum, n) => sum + n, 0) : 0,
+    claudeWaiters: poolScheduler ? poolScheduler.queuedTotal() : 0,
+    codexInFlight: listVms(cfg.paths.project)
+      .filter(isCodexVm)
+      .reduce((sum, vm) => sum + openAIRuntimeSignals(vm.id).inFlight, 0),
+    codexWaiters: openAIWaiterCount(),
+  }),
+  waitBackground: async () => {
+    // An admitted panel handler may have reconfigured a scheduler while HTTP
+    // was draining; stop those timers again before observing their existing work.
+    stopBackgroundSchedulers()
+    await Promise.all([
+      healthMonitor?.whenIdle?.(),
+      credentialRefreshMonitor?.whenIdle?.(),
+      usageProbeMonitor?.whenIdle?.(),
+      kernelWatchdog?.whenIdle?.(),
+      cliNodeGuard?.whenIdle?.(),
+      proxyPool.whenIdle(),
+      notifyMonitor?.whenIdle?.(),
+    ])
+    await waitExistingCredentialRefreshes()
+  },
+  finalize: async () => {
+    stopVmWatch()
+    stopAllRustKernels()
+    await clusterManager.stop()
+    closeDatabase()
+    console.log('[shutdown] admitted requests and credential work drained; exiting')
+    process.exit(0)
+  },
+  onError: (error) => console.warn('[shutdown] waiting for reliable pool state:', error?.message || error),
+})
+const shutdown = (signal) =>
+  shutdownController.shutdown(signal).catch((error) => {
+    console.error('[shutdown] drain failed; process retained:', error)
+  })
+process.on('SIGTERM', () => {
+  void shutdown('SIGTERM')
+})
+process.on('SIGINT', () => {
+  void shutdown('SIGINT')
+})
 
 server.listen(cfg.port, cfg.host, () => {
+  if (shutdownController.draining) return
   try {
     healthMonitor?.start?.({ immediate: true })
   } catch (e) {

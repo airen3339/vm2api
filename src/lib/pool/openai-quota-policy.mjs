@@ -85,7 +85,8 @@ export function mergeOpenAIQuotaPolicy(current, patch) {
 export function openAIConcurrencyOf(vm, policy = OPENAI_QUOTA_DEFAULTS) {
   const raw = vm?.policy?.maxConcurrency ?? vm?.max_concurrency
   const own = vm?.policy?.concurrencyOverride ?? vm?.concurrency_override ?? vm?.max_concurrency_override
-  if (own !== false && Number.isInteger(raw) && raw >= 0) return raw || 2
+  if (own === true && raw === 0) return 0
+  if (own !== false && Number.isInteger(raw) && raw > 0) return raw
   return normalizeOpenAIQuotaPolicy(policy).max_concurrency
 }
 

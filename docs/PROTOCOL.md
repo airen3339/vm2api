@@ -74,6 +74,8 @@ Go worker JSON 透传，不必因人设重建 worker。
 
 非官方缺省还可补 `output_config.effort=high`，**不覆盖**已有 thinking / max_tokens。最新 main 在 unofficial 缺 `thinking.display` 时补 `omitted`。
 
+原生 CLI hop 的当前上游拒绝 `thinking.type=adaptive` 搭配 `display=updates`，即使客户端带 `thinking-display-updates-2026-08-18` beta。CLI 自建出站 beta，入站 beta 不会直接转发。`prepareCliHopBody` 在模型规则处理后，将该组合的 `display` 转为 `summarized`，普通请求和修复重试均适用。客户端可继续发送 `updates`；思考模式和预算沿用原有模型规则，返回使用上游支持的摘要显示，不能保证与 `updates` 实时更新语义等价。已支持的 `summarized` / `omitted` 和未知显示值保持原值；此兼容转换仅适用于 CLI hop。
+
 虚拟机测试未传 `max_tokens` 时用模型策略 `max_tokens_default`，再不行用 64（健康探测 hello 同口径）。
 
 ## beta 与 1M
@@ -113,7 +115,9 @@ Rikka / 客户端 `search_web`、`scrape_web` **不是** Anthropic 自带搜索�
 1. `thinking` 文本为空的（非官方被补 `display: omitted` 后 haiku 只回签名不回文本，这类块出站前就没了）
 2. 签名短于 24 字符或是 dummy 的（`hasUsableThinkingSignature`，兜第三方截断的 SSE 签名）
 
-HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但职责不同。cli-hop 的 Node 清除 caller `cache_control` 后写入最后消息及 `messages.length>=4` 时倒数第二 user 的断点，TTL 用入站会话已 pin 值。native Claude Code CLI 每个 job 热读 slot `kernel.json` 做 persona 布局，自产 system/tools 标记必须沿用同一请求 TTL，不得再从面板独立决策。Rust kernel 只认证、转发和流式传输，不再重打 last。Node 出站 JSON 不是最终 wire。HTTP hop 仍可由 Node 按自己的路由策略整流缓存。
+HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但职责不同。cli-hop 的 Node 清除 caller `cache_control` 后写入最后消息及 `messages.length>=4` 时倒数第二 user 的断点，TTL 用入站会话已 pin 值。如果连续 user 合并后只剩一条 user，且 content 至少四块、全部是非空文本，则保留 tail 断点，并在零基位置 `N-3` 补一个历史断点（其后留下两块）。这给“旧末尾两块变化、再追加一块”的下一轮保留可回查的历史前缀；不是跨请求比对的结果，真实命中仍由上游判定。混合媒体或工具块不启用该补充规则，message 断点总数最多两个。
+
+native Claude Code CLI 每个 job 热读 slot `kernel.json` 做 persona 布局，自产 system/tools 标记必须沿用同一请求 TTL，不得再从面板独立决策。Rust kernel 只认证、转发和流式传输，不再重打 last。Node 出站 JSON 不是最终 wire。HTTP hop 仍可由 Node 按自己的路由策略整流缓存。
 
 长度够的签名原样转发，由 Anthropic 验。上游**严格验签名自身完整性**：乱码签名回 400 `Invalid \`signature\` in \`thinking\` block`。但签名**不与 thinking 文本绑定、也不与模型绑定** —— 真签名配改写过的文本、或 sonnet 的签名打到 opus / haiku，上游都 200（2026-08-28 实测，见 `测试结果/2026-08-28-thinking-signature/`）。
 

@@ -15,7 +15,7 @@ import {
 } from './model-policy.mjs'
 import { hasClaudeCode1mSuffix, stripClaudeCode1mSuffix } from './context-1m.mjs'
 import { isGptSeriesId } from './gpt-ids.mjs'
-import { listGptPolicyModels } from './gpt-model-policy.mjs'
+import { listGptPolicyModels, listNativeCodexModelCatalog } from './gpt-model-policy.mjs'
 
 const FAMILY_ALIASES = new Map([
   ['sonnet', 'sonnet'],
@@ -75,6 +75,12 @@ export function gatewayModelCatalog({ groupType = 'all' } = {}) {
     data: [...gpt, ...claude],
     source: cache.source || 'model-policy',
   }
+}
+
+/** Native Codex shape; null until a complete live ModelInfo is synced. */
+export function nativeCodexModelCatalog() {
+  const models = listNativeCodexModelCatalog()
+  return models.length ? { models } : null
 }
 
 export function isCatalogModelId(id) {

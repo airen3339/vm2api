@@ -7,6 +7,7 @@ services:
     image: ${VM2API_IMAGE:-ghcr.io/dofastted/vm2api}:${VM2API_IMAGE_TAG:-latest}
     container_name: ${VM2API_CONTAINER_NAME:-vm2api}
     restart: unless-stopped
+    stop_grace_period: 20m
     init: true
     network_mode: host
     cap_add:

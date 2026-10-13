@@ -67,6 +67,12 @@ test('OpenAI policy pins and null-reset inheritance remain platform-local', () =
   assert.equal(effectiveOpenAIPolicy({ policy: { maxSessions: 6, sessionsOverride: true } }, global).max_sessions, 6)
 })
 
+test('explicit zero concurrency override remains unlimited while legacy zero inherits the default', () => {
+  assert.equal(effectiveOpenAIPolicy({ policy: { maxConcurrency: 0, concurrencyOverride: true } }).max_concurrency, 0)
+  assert.equal(effectiveOpenAIPolicy({ policy: { maxConcurrency: 0 } }).max_concurrency, 2)
+  assert.equal(effectiveOpenAIPolicy({ policy: { maxConcurrency: 0, concurrencyOverride: false } }).max_concurrency, 2)
+})
+
 test('extraFromRateLimit maps shorter window to 5h', () => {
   const extra = extraFromRateLimit({
     primary_window: {

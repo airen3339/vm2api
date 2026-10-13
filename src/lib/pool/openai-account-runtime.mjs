@@ -8,6 +8,8 @@ const FAILURE_ALPHA = 0.2
 const CAPACITY_ALPHA = 0.4
 const FAILURE_HALF_LIFE_MS = 15 * 60 * 1000
 const RPM_WINDOW_MS = 60_000
+const BUSY_HOLD_BASE_MS = 2_000
+const BUSY_HOLD_MAX_MS = 30_000
 
 export const OPENAI_MAX_WAITERS = 100
 
@@ -20,10 +22,23 @@ function slotOf(id) {
   const key = String(id || '')
   let slot = slots.get(key)
   if (!slot) {
-    slot = { inFlight: 0, lastStartedAt: null, starts: [] }
+    slot = { inFlight: 0, lastStartedAt: null, starts: [], busyUntil: 0, busyStreak: 0 }
     slots.set(key, slot)
   }
   return slot
+}
+
+/**
+ * The slot's kernel refused a request this process had room for (it keeps
+ * its own per-account RPM window). Hold new admissions there; each refusal in
+ * a row doubles the hold, a success clears it.
+ */
+export function markOpenAISlotBusy(id, { now = Date.now() } = {}) {
+  const slot = slotOf(id)
+  slot.busyStreak = Math.min(slot.busyStreak + 1, 8)
+  const hold = Math.min(BUSY_HOLD_MAX_MS, BUSY_HOLD_BASE_MS * 2 ** (slot.busyStreak - 1))
+  slot.busyUntil = Math.max(slot.busyUntil, now + hold)
+  return slot.busyUntil
 }
 
 function decayedFailure(entry, now) {
@@ -47,6 +62,7 @@ export function openAIRuntimeSignals(id, now = Date.now()) {
   return {
     inFlight: slot?.inFlight || 0,
     lastStartedAt: slot?.lastStartedAt ?? null,
+    busyUntil: slot?.busyUntil > now ? slot.busyUntil : null,
     rpmCount: recentStarts(slot, now),
     rpmResetAt: slot?.starts?.length ? slot.starts[0] + RPM_WINDOW_MS : null,
     failureRateBps: Math.round(Math.min(1, Math.max(0, failure)) * 10_000),
@@ -82,6 +98,7 @@ export function tryAcquireOpenAISlot(id, { concurrency = 1, maxRpm = 0, now = Da
   const effectiveRpm = Number.isFinite(Number(maxRpm)) ? Number(maxRpm) : Number(quotaPolicy?.max_rpm)
   const cap = Number(effectiveConcurrency) > 0 ? Number(effectiveConcurrency) : 1
   const slot = slotOf(id)
+  if (slot.busyUntil > now) return null
   if (slot.inFlight >= cap) return null
   const rpm = Number(effectiveRpm) || 0
   if (rpm > 0 && recentStarts(slot, now) >= rpm) return null
@@ -152,6 +169,13 @@ export function waitForOpenAICapacity({ deadline, signal = null } = {}) {
 export function reportOpenAIAttempt(id, kind, firstOutputMs = null, now = Date.now()) {
   const key = String(id || '')
   if (!key) return
+  if (kind === 'succeeded') {
+    const slot = slots.get(key)
+    if (slot) {
+      slot.busyUntil = 0
+      slot.busyStreak = 0
+    }
+  }
   const entry = feedback.get(key) || { value: 0, updatedAt: null, latency: null }
   const sample = kind === 'succeeded' ? 0 : 1
   const alpha = kind === 'capacity_rejected' ? CAPACITY_ALPHA : FAILURE_ALPHA

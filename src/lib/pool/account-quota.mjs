@@ -170,7 +170,7 @@ export class AccountQuota {
     acc.unified.header_stall = 0
 
     const countRequest = extra.countRequest !== false
-    const exhausted = extra.exhausted === true || extra.status === 429 || isUnifiedRejected(h)
+    const exhausted = extra.exhausted === true || isUnifiedRejected(h)
     const writeExtra = countRequest || exhausted
     const u5 = num(h['anthropic-ratelimit-unified-5h-utilization'])
     const u7 = num(h['anthropic-ratelimit-unified-7d-utilization'])
@@ -1025,17 +1025,18 @@ export class AccountQuota {
     return Number.isFinite(n) && n >= 0 ? n : 2
   }
 
-  /** 0 = reject. Manual pin uses the stored cap; otherwise the live tier. */
+  /** An explicit 0 removes the gateway concurrency cap. */
   limitFor(acc, policy = null) {
+    const unlimited = (value) => (value === 0 ? Number.MAX_SAFE_INTEGER : value)
     if (acc?.concurrency_override) {
       const n = Number(acc.max_concurrency)
-      if (Number.isFinite(n) && n >= 0) return n
+      if (Number.isFinite(n) && n >= 0) return unlimited(n)
     }
     const fromPolicy = Number((policy || this.policyFor(acc))?.max_concurrency)
-    if (Number.isFinite(fromPolicy) && fromPolicy >= 0) return fromPolicy
+    if (Number.isFinite(fromPolicy) && fromPolicy >= 0) return unlimited(fromPolicy)
     const n = Number(acc?.max_concurrency)
-    if (Number.isFinite(n) && n >= 0) return n
-    return this.defaultMax()
+    if (Number.isFinite(n) && n >= 0) return unlimited(n)
+    return unlimited(this.defaultMax())
   }
 
   defaultRpm() {

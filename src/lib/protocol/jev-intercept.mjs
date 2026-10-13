@@ -10,9 +10,9 @@
  * A line may be `https://host[/v1/systemone] <key>`.
  */
 import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
-import { refusalUserDocument } from '../core/refusal-similarity.mjs'
 import { normalizeText } from '../core/distill-detect.mjs'
 import { prepareInterceptText } from './jev-prepare.mjs'
+import { policyUserDocument } from './policy-user-document.mjs'
 
 export const JEV_SETTING = 'jev_intercept'
 export const JEV_CATEGORIES = Object.freeze(['nsfw', 'distill', 'crack', 'jailbreak'])
@@ -616,12 +616,27 @@ export function applyJevPatch(settings, body = {}) {
   return { ok: true, config: publicJevConfig(next) }
 }
 
-export function policyBlockError(requestId) {
+const POLICY_CATEGORY_LABELS = Object.freeze({
+  nsfw: '色情内容',
+  distill: '模型蒸馏',
+  crack: '软件授权破解',
+  jailbreak: '安全规则绕过',
+  safety: '内容安全策略',
+  custom: '自定义内容策略',
+})
+
+export function policyBlockError(requestId, { blockedBy = 'protocol_policy', category = 'custom' } = {}) {
+  const label = Object.hasOwn(POLICY_CATEGORY_LABELS, category)
+    ? POLICY_CATEGORY_LABELS[category]
+    : POLICY_CATEGORY_LABELS.custom
   return makeError({
-    type: ErrorType.PERMISSION,
+    type: ErrorType.INVALID_REQUEST,
     code: ErrorCode.POLICY_BLOCKED,
-    message: POLICY_BLOCK_MESSAGE,
-    status: 403,
+    message: `${POLICY_BLOCK_MESSAGE}: ${label}。请调整请求内容；重新登录不会解除此策略拦截。`,
+    // Claude Code treats every 401/403 as an authentication failure, regardless of error type/code.
+    // Local content rejection is an invalid request; actual auth and upstream refusals keep 401/403.
+    status: 400,
+    details: { blocked_by: blockedBy, category, retryable: false },
     request_id: requestId,
   })
 }
@@ -663,10 +678,10 @@ export function matchHardPolicy(text, extra = [], rules = null) {
 
 /** Hard regex sees user-authored turns only. Tool results and official system text are not scanned. */
 export function jevDocument(inbound, body = inbound) {
-  return refusalUserDocument(inbound, body, { includeToolResults: false })
+  return policyUserDocument(inbound, body)
 }
 
-/** Jev also sees the client system. Roleplay tasks put the sexual text there and leave the user turn as a character card. */
+/** Decision models retain client system/instructions while hard regex stays user-only. */
 export function jevModelDocument(inbound, body = inbound) {
   const seen = new Set()
   const parts = []
@@ -677,13 +692,10 @@ export function jevModelDocument(inbound, body = inbound) {
     parts.push(norm)
   }
   for (const src of [inbound, body]) {
-    // Responses carries the client system prompt as `instructions`.
     for (const field of ['system', 'instructions']) {
       const system = src?.[field]
       const blocks = typeof system === 'string' ? [system] : Array.isArray(system) ? system : []
-      for (const block of blocks) {
-        push(typeof block === 'string' ? block : block?.text)
-      }
+      for (const block of blocks) push(typeof block === 'string' ? block : block?.text)
     }
   }
   const user = jevDocument(inbound, body)
