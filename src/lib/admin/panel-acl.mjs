@@ -162,6 +162,7 @@ function userVmPathAllowed(method, path) {
     if (!rest) return true
     if (rest === 'oauth/credential' || rest === 'package') return false
     return (
+      rest === 'test-schedule' ||
       rest.startsWith('oauth/') ||
       rest === 'probe' ||
       rest === 'count-tokens' ||
@@ -192,8 +193,8 @@ function userVmPathAllowed(method, path) {
       rest.startsWith('oauth/')
     )
   }
-  if (method === 'DELETE') return !rest
-  if (method === 'PUT' && rest === 'oauth/credential') return true
+  if (method === 'PUT') return rest === 'test-schedule' || rest === 'oauth/credential'
+  if (method === 'DELETE') return !rest || rest === 'test-schedule'
   return false
 }
 

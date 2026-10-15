@@ -104,6 +104,7 @@ const REACHED = new Error('reached-scheduler')
 function protocolHarness({ routing, body, healthMonitor }) {
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
   const stats = { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 }
+  const poolCalls = []
   const handler = createHandleProtocol({
     json: (_res, status, payload) => {
       response.status = status
@@ -130,16 +131,22 @@ function protocolHarness({ routing, body, healthMonitor }) {
       },
     },
     apiEndpointStore: {},
+    getFailoverRunner: () => ({
+      run: async (input) => {
+        poolCalls.push(input)
+        throw REACHED
+      },
+    }),
     stats,
     getRoutingConfig: () => routing,
     groupsRepo: { rateMultiplier: () => 1 },
     getHealthMonitor: () => healthMonitor,
   })
-  return { handler, response }
+  return { handler, response, poolCalls }
 }
 
 async function runProtocol({ routing, body, headers, protocol = 'anthropic.messages', healthMonitor }) {
-  const { handler, response } = protocolHarness({ routing, body, healthMonitor })
+  const { handler, response, poolCalls } = protocolHarness({ routing, body, healthMonitor })
   const req = {
     method: 'POST',
     url: '/v1/messages',
@@ -155,7 +162,10 @@ async function runProtocol({ routing, body, headers, protocol = 'anthropic.messa
     if (error !== REACHED) throw error
     reached = true
   }
-  return { reached, status: response.status, code: response.body?.error?.code }
+  const out = { reached, status: response.status, code: response.body?.error?.code }
+  if (poolCalls.length) out.countUsage = poolCalls[0].countUsage
+  if (Array.isArray(response.body?.content)) out.content = response.body.content
+  return out
 }
 
 const AXIOS = { 'user-agent': 'axios/1.7' }
@@ -192,6 +202,69 @@ test('switch on: health probes are refused, never answered from the probe cache'
   }
   assert.equal(isClaudeCodeFamilyRequest(CLI_HEADERS, accountTest), true)
   assert.deepEqual(await runProtocol({ routing: ON, body: accountTest, headers: CLI_HEADERS, healthMonitor }), BLOCKED)
+  assert.deepEqual(seen, [])
+})
+
+test('pinned master diagnostics skip health-cache replies and retain usage accounting', async () => {
+  const seen = []
+  const result = await runProtocol({
+    routing: {},
+    body: {
+      model: 'claude-haiku-4-5',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'hello' }],
+    },
+    headers: {
+      'user-agent': 'Go-http-client/2.0',
+      'x-kin-vm': 'vm-01',
+      'x-kin-backend': 'oauth',
+    },
+    healthMonitor: {
+      decide: () => {
+        seen.push('decide')
+        return { action: 'cache', snapshot: {} }
+      },
+    },
+  })
+  assert.equal(result.reached, true)
+  assert.equal(result.countUsage, true)
+  assert.deepEqual(seen, [])
+})
+
+test('pinned master Haiku ping reaches upstream while normal client warmup stays intercepted', async () => {
+  const body = {
+    model: 'claude-haiku-4-5',
+    max_tokens: 1,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'quota' }] }],
+  }
+  const seen = []
+  const healthMonitor = {
+    decide: () => {
+      seen.push('decide')
+      return { action: 'pass' }
+    },
+    getConfig: () => ({ intercept_warmup: true }),
+  }
+
+  const normal = await runProtocol({
+    routing: {},
+    body,
+    headers: { 'user-agent': CLI_UA, 'x-kin-backend': 'oauth' },
+    healthMonitor,
+  })
+  assert.equal(normal.status, 200)
+  assert.equal(normal.content?.[0]?.text, '#')
+  assert.deepEqual(seen, ['decide'])
+
+  seen.length = 0
+  const pinned = await runProtocol({
+    routing: {},
+    body,
+    headers: { 'user-agent': CLI_UA, 'x-kin-vm': 'vm-01', 'x-kin-backend': 'oauth' },
+    healthMonitor,
+  })
+  assert.equal(pinned.reached, true)
+  assert.equal(pinned.countUsage, true)
   assert.deepEqual(seen, [])
 })
 

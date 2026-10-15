@@ -559,7 +559,9 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
     }
-    const healthDecision = getHealthMonitor()?.decide?.(req.headers, inbound, protocol)
+    const healthDecision = panelDiagnostics
+      ? { action: 'pass' }
+      : getHealthMonitor()?.decide?.(req.headers, inbound, protocol)
     if (healthDecision?.action === 'fail') {
       stats.requests++
       stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -673,6 +675,7 @@ export function createHandleProtocol(deps) {
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest
     // of the gate scans them only when jev.openai_platform_enabled is on.
     if (
+      !panelDiagnostics &&
       platform.platform !== 'openai' &&
       protocol === 'anthropic.messages' &&
       getHealthMonitor()?.getConfig?.()?.intercept_warmup === true

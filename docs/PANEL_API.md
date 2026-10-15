@@ -68,6 +68,7 @@
 | POST | `/vms/:id/schedulable` | `{ schedulable }` 是否入池；不改容器 |
 | POST | `/vms/:id/cooldown/clear` | 清账号/模型冷却、粘性钉和 `/usage` 429 旗标，重新入池 |
 | POST | `/vms/:id/test-chat` | loopback `POST /v1/messages`，master 可钉槽；官方 CC 入站 + 4 块 system。默认 prompt `hello` |
+| GET/PUT/DELETE | `/vms/:id/test-schedule` | 每 VM 一条真实对话计划，回 `{ schedule }`。PUT 保存 `{ enabled?, cron, timezone, model, prompt, max_tokens?, reasoning_effort? }`；`enabled` 缺省为 `false`，cron 限五段表达式，timezone 为 IANA 名称。Claude 用 `max_tokens`，Codex 用 `reasoning_effort`。GET/PUT 的计划含最近结果、下次运行时间和运行状态；定时运行按固定 VM 发起真实测试并正常计入用量，进程重启后恢复计划但不补跑停机时错过的时刻；删除 VM 时一并删除计划 |
 | POST | `/vms/:id/count-tokens` | Setup Token / Console API Key 经槽 Go worker SOCKS 打官方 `POST /v1/messages/count_tokens`。body `{ model, messages, system?, tools? }`。完整 OAuth 400 `count_tokens_unsupported`。成功 `{ input_tokens, model, credential_mode, vm_id }` |
 | POST | `/vms/:id/oauth/refresh` | 只转发 worker `Ensure`，不回 token |
 | POST | `/vms/:id/oauth/to-setup-token` | 把当前完整 OAuth 活票改成 Setup Token（保留 refresh/过期）。已是 setup-token 则幂等 |

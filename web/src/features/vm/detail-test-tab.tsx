@@ -40,6 +40,7 @@ type VmTestTabProps = {
   onReasoningEffortChange: (value: string) => void
   onTest: () => void
   onRefreshModels: () => void
+  schedule?: React.ReactNode
 }
 
 const CODEX_EFFORTS = [
@@ -80,6 +81,7 @@ export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
     onReasoningEffortChange,
     onTest,
     onRefreshModels,
+    schedule,
   } = props
 
   return (
@@ -185,6 +187,7 @@ export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
               刷新列表
             </Button>
           </div>
+          {schedule}
         </CardContent>
       </Card>
       <TestChatResultCard result={result} running={running} vm={vm} />

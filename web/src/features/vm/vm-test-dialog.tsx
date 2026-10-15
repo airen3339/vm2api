@@ -11,6 +11,7 @@ import {
 import { SlotIdentity } from '@/components/platform-chip'
 import { VmTestPanel } from '@/features/vm/detail-test-tab'
 import { useVmTestChat } from '@/features/vm/use-vm-test-chat'
+import { VmTestSchedule } from '@/features/vm/vm-test-schedule'
 
 function TestBody({ vm }: { vm: Vm }) {
   const chat = useVmTestChat(vm)
@@ -21,6 +22,7 @@ function TestBody({ vm }: { vm: Vm }) {
       credType={credTypeOf(vm)}
       isCodex={isCodexVm(vm)}
       dataplane={vm.resolved_dataplane}
+      schedule={<VmTestSchedule vm={vm} {...chat} />}
     />
   )
 }

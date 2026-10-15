@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { TestModelsPayload, Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
@@ -17,6 +17,12 @@ export function useVmTestChat(vm: Vm) {
   const [maxTokens, setMaxTokens] = useState(8192)
   const [reasoningEffort, setReasoningEffort] = useState('medium')
   const [result, setResult] = useState<TestChatResult | null>(null)
+  const edited = useRef({
+    model: false,
+    prompt: false,
+    maxTokens: false,
+    reasoningEffort: false,
+  })
   const models = useMemo(
     () => testModels.data?.items || testModels.data?.models || [],
     [testModels.data]
@@ -28,6 +34,42 @@ export function useVmTestChat(vm: Vm) {
       setModel(models[0].id)
     }
   }, [models, model])
+
+  const onModelChange = useCallback((value: string) => {
+    edited.current.model = true
+    setModel(value)
+  }, [])
+  const onPromptChange = useCallback((value: string) => {
+    edited.current.prompt = true
+    setPrompt(value)
+  }, [])
+  const onMaxTokensChange = useCallback((value: number) => {
+    edited.current.maxTokens = true
+    setMaxTokens(value)
+  }, [])
+  const onReasoningEffortChange = useCallback((value: string) => {
+    edited.current.reasoningEffort = true
+    setReasoningEffort(value)
+  }, [])
+  const onLoadSchedule = useCallback(
+    (schedule: {
+      model: string
+      prompt: string
+      max_tokens: number | null
+      reasoning_effort: string | null
+    }) => {
+      if (!edited.current.model) setModel(schedule.model)
+      if (!edited.current.prompt) setPrompt(schedule.prompt)
+      if (isCodexVm(vm)) {
+        if (!edited.current.reasoningEffort) {
+          setReasoningEffort(schedule.reasoning_effort || 'medium')
+        }
+      } else if (!edited.current.maxTokens) {
+        setMaxTokens(schedule.max_tokens || 64)
+      }
+    },
+    [vm]
+  )
 
   const send = useMutation({
     mutationFn: () =>
@@ -86,10 +128,11 @@ export function useVmTestChat(vm: Vm) {
     result,
     running: send.isPending,
     modelsRefreshing: testModels.isFetching,
-    onModelChange: setModel,
-    onPromptChange: setPrompt,
-    onMaxTokensChange: setMaxTokens,
-    onReasoningEffortChange: setReasoningEffort,
+    onModelChange,
+    onPromptChange,
+    onMaxTokensChange,
+    onReasoningEffortChange,
+    onLoadSchedule,
     onTest: () => {
       setResult(null)
       send.mutate()
