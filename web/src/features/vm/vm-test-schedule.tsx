@@ -8,12 +8,12 @@ import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover'
 import { Switch } from '@/components/ui/switch'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 
 type TestSchedule = {
   enabled: boolean
@@ -85,6 +85,7 @@ export function VmTestSchedule({
   const [enabled, setEnabled] = useState(false)
   const [cron, setCron] = useState(DEFAULT_CRON)
   const [timezone, setTimezone] = useState(localTimezone)
+  const [helpOpen, setHelpOpen] = useState(false)
   const scheduleQuery = useQuery({
     queryKey,
     queryFn: ({ queryKey: key, signal }) =>
@@ -203,24 +204,28 @@ export function VmTestSchedule({
           <div className='space-y-1.5'>
             <div className='flex items-center gap-1'>
               <Label htmlFor={`vm-test-cron-${vm.id}`}>Cron 表达式</Label>
-              <Popover>
-                <PopoverTrigger asChild>
+              <Tooltip open={helpOpen} onOpenChange={setHelpOpen}>
+                <TooltipTrigger asChild>
                   <Button
                     type='button'
                     size='icon'
                     variant='ghost'
                     className='size-6 text-muted-foreground'
                     aria-label='Cron 表达式示例'
-                    title='Cron 表达式示例'
+                    onClick={() => {
+                      if (window.matchMedia('(hover: none)').matches) {
+                        setHelpOpen((open) => !open)
+                      }
+                    }}
                   >
                     <CircleHelp className='size-4' />
                   </Button>
-                </PopoverTrigger>
-                <PopoverContent
+                </TooltipTrigger>
+                <TooltipContent
                   align='start'
                   side='top'
                   collisionPadding={16}
-                  className='max-h-[min(70dvh,26rem)] w-[min(22rem,calc(100vw-2rem))] overflow-y-auto p-3 text-xs leading-5'
+                  className='max-h-[min(70dvh,26rem)] w-[min(22rem,calc(100vw-2rem))] overflow-y-auto border bg-popover p-3 text-left text-xs leading-5 text-popover-foreground shadow-md [&>span]:hidden'
                 >
                   <p className='font-medium'>Cron 表达式示例</p>
                   <p className='mt-1 text-muted-foreground'>
@@ -240,8 +245,8 @@ export function VmTestSchedule({
                     按 {timezone}{' '}
                     时区运行。真实测试会消耗模型额度，建议先从每天一次开始。
                   </p>
-                </PopoverContent>
-              </Popover>
+                </TooltipContent>
+              </Tooltip>
             </div>
             <Input
               id={`vm-test-cron-${vm.id}`}
