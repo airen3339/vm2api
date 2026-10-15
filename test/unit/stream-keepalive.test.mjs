@@ -1,5 +1,10 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 import {
   buildClaudeCodeNoopDeltaKeepalive,
   buildPingKeepalive,
@@ -81,7 +86,7 @@ test('createDownstreamKeepalive emits a ping after idle', async () => {
   assert.ok(writes.some((chunk) => chunk.includes('event: ping')))
 })
 
-test('keepalive arm starts pinging before the first upstream event', async () => {
+test('start alone does not ping before the first upstream event (REQ-0429)', async () => {
   const writes = []
   const keepalive = createDownstreamKeepalive({
     intervalMs: 20,
@@ -90,8 +95,31 @@ test('keepalive arm starts pinging before the first upstream event', async () =>
     write: (chunk) => writes.push(chunk),
   })
   keepalive.start()
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  keepalive.stop()
+  assert.equal(writes.length, 0)
+})
+
+test('keepalive arm starts pinging before the first upstream event', async () => {
+  const writes = []
+  const keepalive = createDownstreamKeepalive({
+    intervalMs: 20,
+    userAgent: 'claude-cli/2.1.187 (external, cli)',
+    protocol: 'anthropic.messages',
+    write: (chunk) => writes.push(chunk),
+  })
   keepalive.arm()
   await new Promise((resolve) => setTimeout(resolve, 80))
   keepalive.stop()
   assert.ok(writes.some((chunk) => chunk.includes('event: ping')))
+})
+
+test('handleProtocol streaming attempt arms downstream keepalive before TTFT', () => {
+  const src = fs.readFileSync(path.join(root, 'src/lib/protocol/handle-protocol.mjs'), 'utf8')
+  const marker = 'const keepalive = createDownstreamKeepalive({'
+  const idx = src.indexOf(marker)
+  assert.ok(idx > 0)
+  const chunk = src.slice(idx, idx + 600)
+  assert.match(chunk, /keepalive\.arm\(\)/)
+  assert.doesNotMatch(chunk, /keepalive\.start\(\)/)
 })

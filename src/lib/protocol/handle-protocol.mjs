@@ -1380,7 +1380,7 @@ export function createHandleProtocol(deps) {
               res.write(chunk)
             },
           })
-          keepalive.start()
+          keepalive.arm()
           try {
             return await dispatchStreamInference({
               exec: candidate.exec,
