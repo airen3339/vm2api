@@ -304,3 +304,35 @@ test('master API key still administers panel users', async () => {
     await gw.stop()
   }
 })
+
+test('Mihomo management is available to admins only and validates actions', async () => {
+  const gw = await startGateway()
+  try {
+    const admin = await login(gw, 'admin', 'testpass')
+    const state = await panel(gw, 'GET', '/api/panel/mihomo', { cookie: admin.cookie })
+    assert.equal(state.status, 200, state.text)
+    assert.equal(state.json.data.running, false)
+    assert.deepEqual(state.json.data.sources, [])
+    const changed = await panel(gw, 'POST', '/api/panel/mihomo', {
+      cookie: admin.cookie,
+      body: { action: 'download_mode', mode: 'direct' },
+    })
+    assert.equal(changed.status, 200, changed.text)
+    const bad = await panel(gw, 'POST', '/api/panel/mihomo', { cookie: admin.cookie, body: { action: 'invalid' } })
+    assert.equal(bad.status, 400)
+    await panel(gw, 'POST', '/api/panel/users', {
+      cookie: admin.cookie,
+      body: { username: 'mihomo-reader', password: 'reader-pass', role: 'user' },
+    })
+    const reader = await login(gw, 'mihomo-reader', 'reader-pass')
+    for (const method of ['GET', 'POST']) {
+      const denied = await panel(gw, method, '/api/panel/mihomo', {
+        cookie: reader.cookie,
+        body: method === 'POST' ? { action: 'start' } : undefined,
+      })
+      assert.equal(denied.status, 403)
+    }
+  } finally {
+    await gw.stop()
+  }
+})

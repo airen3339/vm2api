@@ -50,6 +50,7 @@ export function ProxyEditDialog({
   // 代理名称只影响显示：只改名称时网关不会重载已绑槽位的 worker。
   const labelChanged = label.trim() !== String(proxy?.label || '')
   const localProxy = proxy?.kind === 'local' || proxy?.scheme === 'local'
+  const managed = !!proxy?.managed
 
   // 按 id 重置，而不是按对象身份。代理页每次 refetch 都会产出新的 proxy 对象，
   // 若依赖对象引用，编辑期间的一次后台刷新就会把用户正在输入的账密清空。
@@ -154,6 +155,7 @@ export function ProxyEditDialog({
             <div className='space-y-1'>
               <Label>主机</Label>
               <Input
+                readOnly={managed}
                 value={host}
                 onChange={(e) => setHost(e.target.value)}
                 aria-invalid={hostBad}
@@ -162,6 +164,7 @@ export function ProxyEditDialog({
             <div className='space-y-1'>
               <Label>端口</Label>
               <Input
+                readOnly={managed}
                 value={port}
                 inputMode='numeric'
                 onChange={(e) => setPort(e.target.value)}
@@ -184,7 +187,7 @@ export function ProxyEditDialog({
             <Label>用户名</Label>
             <Input
               value={username}
-              disabled={clearAuth}
+              disabled={clearAuth || managed}
               onChange={(e) => setUsername(e.target.value)}
               placeholder={proxy?.has_auth ? '留空则不修改' : '（当前无账密）'}
             />
@@ -194,12 +197,12 @@ export function ProxyEditDialog({
             <Input
               type='password'
               value={password}
-              disabled={clearAuth}
+              disabled={clearAuth || managed}
               onChange={(e) => setPassword(e.target.value)}
               placeholder={proxy?.has_auth ? '留空则不修改' : '（当前无账密）'}
             />
           </div>
-          {proxy?.has_auth ? (
+          {proxy?.has_auth && !managed ? (
             <label className='flex items-center gap-2 text-sm'>
               <input
                 type='checkbox'
@@ -219,9 +222,11 @@ export function ProxyEditDialog({
           ) : null}
 
           <p className='text-xs text-muted-foreground'>
-            账密不会回显。留空表示保持原值。
+            {managed
+              ? '地址与账密由 Mihomo 自动管理，此处仅修改名称。上游配置请在 Mihomo 来源中修改。'
+              : '账密不会回显。留空表示保持原值。'}
           </p>
-          {localProxy ? null : (
+          {localProxy || managed ? null : (
             <label className='flex items-center gap-2 text-sm'>
               <input
                 type='checkbox'

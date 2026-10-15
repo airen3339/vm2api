@@ -4,7 +4,7 @@
 
 登录：`POST /api/panel/login` `{ username, password }` → token + Cookie `kin_panel_token`（7 天，HttpOnly）。`POST /api/panel/logout` 撤销。`GET /api/panel/me` → `{ user, role, views, capabilities, version }`。`GET/PUT /onboarding` 为首配进度（见「引导」）。
 
-`/admin/*` 仅 master / admin 角色。恢复备份期间协议口 503。
+`/admin/*` 仅 master / admin 角色。恢复备份期间面板与协议口均返回 503。
 
 ## RBAC
 
@@ -334,7 +334,7 @@ Claude 槽测试走官方 CC 入站（`/v1/messages`）。GPT/Codex 槽测试走
 | POST | `/proxies/:id/enable` · `/disable` · `/bind` · `/unbind` · `/reveal` · `/geo` |
 | DELETE | `/proxies/:id` |
 
-恢复期间协议口 503。每个槽位必须绑定 SOCKS5。`PUT /proxies/config` 的 `disconnect_on_error`（默认 false）：运行时 SOCKS 错误立刻停该槽调度、回写失败并重建 worker；其它健康槽仍可 failover。
+恢复期间面板与协议口均返回 503。每个槽位必须绑定 SOCKS5。`PUT /proxies/config` 的 `disconnect_on_error`（默认 false）：运行时 SOCKS 错误立刻停该槽调度、回写失败并重建 worker；其它健康槽仍可 failover。
 
 `PUT /proxies/config` 的 `follow_proxy_timezone`（默认 true）：绑定一条代理后，该槽采用出口节点的 IANA 时区（persona `# Environment`、指纹、容器 `TZ`）。操作者在创建时或 `PATCH /vms/:id` 手动指定过时区的槽不受影响。
 
@@ -385,6 +385,39 @@ Claude 槽测试走官方 CC 入站（`/v1/messages`）。GPT/Codex 槽测试走
 > 除此之外，任何 `/api/panel/*` 响应都不得包含代理账密；`GET /proxies` 永不返回（`publicProxy()` 只吐 `has_auth` 布尔）。
 
 sessionKey / 授权码导入必须走该槽 SOCKS5。
+
+## Mihomo（仅 admin）
+
+`GET /mihomo` 和 `POST /mihomo` 仅允许管理员面板会话或 Master API key；`user`、`super` 和协议密钥不能访问。功能说明见 [Mihomo 订阅与固定节点出口](mihomo.md)。
+
+`GET /mihomo` 返回 `{ ok: true, data }`。`data` 包含 `installed`、`running`、`version`、`latest_version`、`external_kernel`、`busy`、`error`、`install_progress`、`download_mode`、`sources` 和 `nodes`。来源列表不返回完整订阅 URL；节点列表不返回上游连接凭据。`nodes[].proxy_id` 表示已加入代理池的出口，`outlet` 报告其启用、健康和绑定数量，`check` 是本进程中最近一次检测结果。
+
+`POST /mihomo` 使用 JSON 请求体，必填 `action`。来源与节点的 `id` 不可混用；来源 ID 从 `sources` 取，节点 ID 从 `nodes` 取。
+
+| action | 其他字段 | 说明 |
+|------|------|------|
+| `check_update` | 无 | 查询官方最新稳定版本，不自动安装 |
+| `install` | `version?` | 缺省 `latest`，也可填 `vX.Y.Z` 稳定版本；请求者须先停止运行中的内核，安装后自动启动并保存自启动状态 |
+| `start` / `stop` | 无 | 启停内核，同时保存下次控制面启动时是否恢复运行 |
+| `download_mode` | `mode` | `direct`、`proxy` 或 `auto`，只影响订阅下载 |
+| `source_add` | `url`、`label?` | 下载并导入一个 HTTP(S) YAML 订阅 |
+| `dynamic_add` | `text`、`label?` | 按行导入 SOCKS5、HTTP(S) 代理地址 |
+| `source_rename` | 来源 `id`、`label` | 修改显示名，空白名称保持原值 |
+| `source_update` | 来源 `id`、`url`、`label?` | 更新订阅地址并下载；失败保留旧地址和节点 |
+| `source_refresh` | 来源 `id` | 刷新已有订阅；动态代理来源不支持刷新 |
+| `source_enable` / `source_disable` / `source_remove` | 来源 `id` | 启停或删除来源；其他来源仍包含的共享节点继续保留 |
+| `node_enable` / `node_disable` | 节点 `id` 或 `ids` | 启停节点；来源也须启用，节点才可用 |
+| `node_export` / `node_unexport` | 节点 `id` 或 `ids` | 加入或移出代理池；加入前须启用节点并运行内核，移出前须解除槽位绑定 |
+| `test` / `quality` | 单个节点 `id` | 以隔离内核执行连通性或基础质量检测，不修改业务出口和绑定 |
+
+除 `test` / `quality` 返回单节点检测结果外，成功操作均返回状态对象。安装请求持续到安装与启动结束；期间可用 `GET /mihomo` 查询进度。`install_progress.stage` 为 `resolving`、`downloading`、`verifying`、`installing`、`starting`、`complete` 或 `failed`；下载阶段另带 `downloaded_bytes`、`total_bytes`，失败时带 `message`。安装成功但启动失败会明确返回错误，不能按已启动处理。
+
+限制：JSON 请求体最多 256 KiB；来源最多 64 个；单份订阅最多 4 MiB；去重后节点总数最多 4,096；节点批量动作每次最多 100 个；检测最多同时 4 个，同一节点不重复并发。管理写操作互斥，冲突返回 409；检测占满返回 429。无效输入返回 400，缺少来源/节点返回 404，下载或控制失败通常返回 502；错误体为 `{ ok: false, error: { code, message } }`。
+
+`direct` 明确直连下载，`proxy` 只走运行中的 Mihomo，`auto` 在代理下载失败后允许直连。自动回退可能向订阅提供方暴露控制面服务器 IP；这与业务出口故障后拒绝请求的契约不同。
+
+托管代理在 `/proxies` 中带 `managed: true`，ID 使用 `px-mh-` 前缀，只支持控制面本地槽位。普通代理接口仍可改名、启停、解绑和删除；地址与账密由 Mihomo 管理，连接字段修改返回 `mihomo_endpoint_readonly`，远程槽位绑定返回 `mihomo_requires_local_slot`。节点停用或内核停止后，旧绑定保留并拒绝转发，不自动改用其他节点或直连。
+
 
 ## 集群（SSH 节点，仅 admin；super 只读 `GET /cluster/nodes`）
 

@@ -18,8 +18,13 @@ function makePool() {
 
 test('proxy pool persists custom dns_primary and rejects invalid URLs without changing it', (t) => {
   const dir = tmpDir()
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pools = []
+  t.after(() => {
+    for (const pool of pools) pool.db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
   const pool = new ProxyPool({ dataDir: dir })
+  pools.push(pool)
   pool.stopScheduler()
   assert.equal(pool.updateConfig({ dns_primary: '8.8.8.8:53' }).ok, true)
   const primary = 'https://cloudflare-dns.com:8443/dns-query?key=a%2Cb'
@@ -38,14 +43,20 @@ test('proxy pool persists custom dns_primary and rejects invalid URLs without ch
     assert.equal(pool.snapshot().config.dns_primary, primary)
   }
   const reopened = new ProxyPool({ dataDir: dir })
+  pools.push(reopened)
   reopened.stopScheduler()
   assert.equal(reopened.snapshot().config.dns_primary, primary)
 })
 
 test('DNS type suppression persists both toggle states and rejects non-booleans', (t) => {
   const dir = tmpDir()
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pools = []
+  t.after(() => {
+    for (const pool of pools) pool.db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
   const pool = new ProxyPool({ dataDir: dir })
+  pools.push(pool)
   pool.stopScheduler()
   assert.equal(pool.snapshot().config.dns_disable_svcb_https, false)
   assert.equal(pool.updateConfig({ dns_disable_svcb_https: true }).ok, true)
@@ -56,10 +67,12 @@ test('DNS type suppression persists both toggle states and rejects non-booleans'
     assert.equal(pool.snapshot().config.dns_primary, 'auto')
   }
   const reopened = new ProxyPool({ dataDir: dir })
+  pools.push(reopened)
   reopened.stopScheduler()
   assert.equal(reopened.snapshot().config.dns_disable_svcb_https, true)
   assert.equal(reopened.updateConfig({ dns_disable_svcb_https: false }).ok, true)
   const disabled = new ProxyPool({ dataDir: dir })
+  pools.push(disabled)
   disabled.stopScheduler()
   assert.equal(disabled.snapshot().config.dns_disable_svcb_https, false)
 })
@@ -289,4 +302,99 @@ test('local egress probe stays direct when kin-egress is down', async () => {
   assert.equal(row.status, 'ok')
   assert.equal(row.enabled, true)
   assert.equal(disabled.length, 0)
+})
+
+function makeManagedPool(t, options = {}) {
+  const dir = tmpDir('kin-px-mihomo-')
+  const pool = new ProxyPool({ dataDir: dir, ...options })
+  pool.stopScheduler()
+  t.after(() => {
+    pool.stopScheduler()
+    pool.db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  return pool
+}
+
+const MANAGED_ID = 'px-mh-' + 'a'.repeat(24)
+const managedRecord = () => ({
+  id: MANAGED_ID,
+  host: '127.0.0.1',
+  port: 32000,
+  username: 'test',
+  password: 'test',
+  enabled: true,
+})
+
+test('managed and per-node local outlets coexist without allowing a remote managed bind', (t) => {
+  const nodes = { 'vm-local': null, 'vm-remote': 'node-a' }
+  const pool = makeManagedPool(t, {
+    vmNodeOf: (id) => nodes[id],
+    canUseManagedProxy: (id) => nodes[id] === null,
+  })
+  pool.ensureLocal()
+  pool.syncManaged([managedRecord()])
+  assert.equal(pool.bind(MANAGED_ID, 'vm-local').ok, true)
+  assert.equal(pool.bind('px-local', 'vm-remote').proxy.id, 'px-local-node-a')
+  assert.equal(pool.bind(MANAGED_ID, 'vm-remote', { force: true }).error, 'mihomo_requires_local_slot')
+  assert.equal(pool.getProxyForVm('vm-remote').id, 'px-local-node-a')
+  assert.equal(pool.getProxyForVm('vm-local').id, MANAGED_ID)
+})
+
+test('forced node-row migration preserves the upstream health and capacity bypass', (t) => {
+  const pool = makeManagedPool(t, { vmNodeOf: () => 'node-a' })
+  pool.updateConfig({ bind_limit: 1 })
+  pool.ensureLocal()
+  pool.importLines('10.0.0.12:1080')
+  const previous = pool.snapshot().proxies.find((p) => p.host === '10.0.0.12')
+  assert.equal(pool.bind(previous.id, 'vm-move').ok, true)
+  assert.equal(pool.bind('px-local', 'vm-existing').ok, true)
+  const nodeRow = pool.state.proxies.find((p) => p.id === 'px-local-node-a')
+  nodeRow.enabled = false
+  nodeRow.status = 'dead'
+  assert.equal(pool.bind('px-local', 'vm-move').error, 'proxy_disabled')
+  assert.equal(pool.getProxyForVm('vm-move').id, previous.id)
+  assert.equal(pool.bind('px-local', 'vm-move', { force: true }).ok, true)
+  assert.deepEqual(nodeRow.bound_vm_ids, ['vm-existing', 'vm-move'])
+  assert.equal(pool.snapshot().proxies.find((p) => p.id === previous.id).bound_count, 0)
+})
+
+test('force never bypasses managed mutation, capacity or unavailable-outlet guards', (t) => {
+  const pool = makeManagedPool(t)
+  pool.updateConfig({ bind_limit: 1 })
+  pool.syncManaged([managedRecord()])
+  pool.importLines('10.0.0.13:1080')
+  const previous = pool.snapshot().proxies.find((p) => p.host === '10.0.0.13')
+  assert.equal(pool.bind(MANAGED_ID, 'vm-existing').ok, true)
+  assert.equal(pool.bind(previous.id, 'vm-move').ok, true)
+  pool.managedBusy = true
+  assert.equal(pool.bind(MANAGED_ID, 'vm-move', { force: true }).error, 'mihomo_busy')
+  pool.managedBusy = false
+  assert.equal(pool.bind(MANAGED_ID, 'vm-move', { force: true }).error, 'proxy_bind_limit')
+  assert.equal(pool.getProxyForVm('vm-move').id, previous.id)
+  pool.syncManaged([{ ...managedRecord(), enabled: false }])
+  assert.equal(pool.bind(MANAGED_ID, 'vm-move', { force: true }).error, 'proxy_disabled')
+  assert.equal(pool.getProxyForVm('vm-move').id, previous.id)
+  assert.equal(pool.getProxyForVm('vm-existing'), null)
+})
+
+test('pending node health and late managed success keep their independent unavailable states', async (t) => {
+  const pool = makeManagedPool(t, {
+    vmNodeOf: () => 'node-a',
+    localExitHealth: () => ({ pending: true, error: 'node_link_connecting' }),
+  })
+  pool.ensureLocal()
+  const local = pool.ensureLocalForNode('node-a').proxy
+  const nodeRow = pool.state.proxies.find((p) => p.id === local.id)
+  const before = JSON.stringify(nodeRow)
+  const pending = await pool.probeOne(nodeRow)
+  assert.equal(pending.scope, 'pending')
+  pool._applyProbeResult(nodeRow, pending)
+  assert.equal(JSON.stringify(nodeRow), before)
+  pool.syncManaged([{ ...managedRecord(), enabled: false }])
+  const managed = pool.state.proxies.find((p) => p.id === MANAGED_ID)
+  pool._applyProbeResult(managed, { ok: true, scope: 'socks', latency_ms: 1 })
+  assert.equal(managed.enabled, false)
+  assert.equal(managed.status, 'dead')
+  assert.equal(managed.last_error, 'mihomo_unavailable')
 })

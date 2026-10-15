@@ -36,6 +36,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import zlib from 'node:zlib'
+import { DatabaseSync } from 'node:sqlite'
+import { atomicJson } from '../mihomo/runtime.mjs'
 import { spawnSync } from 'node:child_process'
 import { getDb, getDbPath, closeDatabase, openDatabase, vacuumInto } from '../db/database.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
@@ -45,6 +47,7 @@ import { repairSlotSmbios, repairVmProxyCliEnabled } from '../vm/vm-registry.mjs
 import { invalidateReadCache, isVmRecordFile } from '../vm/vm-file.mjs'
 
 const SCHEDULE_KEY = 'backup_schedule'
+const MIHOMO_BACKUP_KEY = 'backup_mihomo_state'
 
 export const DEFAULT_SCHEDULE = {
   enabled: true,
@@ -83,8 +86,9 @@ export function tarAvailable() {
 }
 
 export class BackupService {
-  constructor({ dataDir, projectRoot, configDir, backupDir, tmpDir, checkIntervalMs = 10 * 60_000 } = {}) {
+  constructor({ dataDir, projectRoot, configDir, backupDir, tmpDir, mihomo, checkIntervalMs = 10 * 60_000 } = {}) {
     this.dataDir = dataDir
+    this.mihomo = mihomo
     this.projectRoot = projectRoot
     this.configDir = configDir || null
     this.backupDir = backupDir || path.join(dataDir, 'backups')
@@ -183,10 +187,18 @@ export class BackupService {
       // 1. online-consistent DB snapshot (WAL-safe)
       const dbSnap = path.join(tmp, 'db', 'kin.db')
       vacuumInto(getDb(), dbSnap)
+      const mihomoFile = path.join(this.dataDir, 'mihomo', 'settings.json')
+      const mihomoSettings = fs.existsSync(mihomoFile) ? JSON.parse(fs.readFileSync(mihomoFile, 'utf8')) : null
+      const snapshot = new DatabaseSync(dbSnap)
+      try {
+        new SettingsRepo(snapshot).set(MIHOMO_BACKUP_KEY, { settings: mihomoSettings })
+      } finally {
+        snapshot.close()
+      }
       const dbBytes = fs.statSync(dbSnap).size
 
       // 2. vm files + config files
-      const includes = { db: true, vms: 0, config: 0 }
+      const includes = { db: true, vms: 0, config: 0, mihomo: !!mihomoSettings }
       const sha256s = { 'db/kin.db': sha256File(dbSnap) }
       const vmsDir = this.projectRoot ? path.join(this.projectRoot, 'vms') : null
       if (vmsDir && fs.existsSync(vmsDir)) {
@@ -217,6 +229,13 @@ export class BackupService {
             includes.config += 1
           } catch {}
         }
+      }
+
+      if (mihomoSettings) {
+        const target = path.join(tmp, 'mihomo', 'settings.json')
+        fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
+        atomicJson(target, mihomoSettings)
+        sha256s['mihomo/settings.json'] = sha256File(target)
       }
 
       // 3. manifest
@@ -344,7 +363,12 @@ export class BackupService {
    * Restore from a recorded backup. Automatically snapshots the current
    * state first (kind=pre_restore). Re-binds stores via onRestored callback.
    */
-  restoreBackup(id) {
+  async restoreBackup(id) {
+    if (this.mihomo) return this.mihomo.exclusive(() => this._restoreBackup(id), { preserveError: true })
+    return this._restoreBackup(id)
+  }
+
+  async _restoreBackup(id) {
     const rec = this._repo().get(id)
     if (!rec) throw Object.assign(new Error('backup not found'), { code: 'backup_not_found' })
     if (rec.status !== 'ok')
@@ -387,6 +411,29 @@ export class BackupService {
         fs.writeFileSync(dbFile, zlib.gunzipSync(fs.readFileSync(rec.file_path)))
       }
       if (!fs.existsSync(dbFile)) throw new Error('no db snapshot inside backup')
+
+      let mihomoSettings = null
+      const snapshot = new DatabaseSync(dbFile, { readOnly: true })
+      try {
+        const saved = new SettingsRepo(snapshot).get(MIHOMO_BACKUP_KEY)
+        if (saved) mihomoSettings = saved.settings
+        else if (snapshot.prepare("SELECT id FROM proxies WHERE id LIKE 'px-mh-%' LIMIT 1").get())
+          throw Object.assign(new Error('此旧备份缺少 Mihomo 配置，无法完整恢复；请使用完整目录备份'), {
+            code: 'backup_mihomo_missing',
+          })
+      } finally {
+        snapshot.close()
+      }
+      if (manifest?.includes?.mihomo) {
+        const settingsFile = path.join(tmp, 'mihomo', 'settings.json')
+        if (!fs.existsSync(settingsFile) || sha256File(settingsFile) !== manifest.sha256s?.['mihomo/settings.json'])
+          throw Object.assign(new Error('Mihomo 配置校验失败'), { code: 'backup_corrupt' })
+        mihomoSettings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+      }
+      if (this.mihomo) {
+        await Promise.allSettled(this.mihomo.pendingChecks)
+        await this.mihomo.runtime.stop()
+      }
 
       // 2. swap the live database
       const dbPath = getDbPath()
@@ -436,8 +483,15 @@ export class BackupService {
         }
       }
 
+      const mihomoFile = path.join(this.dataDir, 'mihomo', 'settings.json')
+      if (mihomoSettings) {
+        fs.mkdirSync(path.dirname(mihomoFile), { recursive: true, mode: 0o700 })
+        atomicJson(mihomoFile, mihomoSettings)
+      } else fs.rmSync(mihomoFile, { force: true })
+
       // 4. reopen + migrate (old backups upgrade automatically)
       const db = openDatabase({ dataDir: this.dataDir, dbPath })
+      new SettingsRepo(db).remove(MIHOMO_BACKUP_KEY)
 
       // 5. db-only backups: rebuild vm files from the credential mirror
       if (this.projectRoot) {
@@ -463,7 +517,8 @@ export class BackupService {
       // 7. re-bind stores to the fresh connection. A failed rebind leaves the
       //    process partially attached to the closed database, so it must make
       //    the restore fail instead of reporting a false success.
-      if (this._rebindStores) this._rebindStores(db)
+      if (this._rebindStores) await this._rebindStores(db)
+      if (this.mihomo) await this.mihomo.reload()
 
       return { ok: true, restored: rec.id, pre_restore: pre.id }
     } finally {

@@ -10,6 +10,7 @@
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import { MihomoManager } from './lib/mihomo/manager.mjs'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
 import {
   extractApiKey,
@@ -62,6 +63,7 @@ import {
   getVm,
   getActiveVmId,
   setVmSchedulable,
+  disableVmForProxy,
   isCodexVm,
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
@@ -352,8 +354,9 @@ proxyPool = new ProxyPool({
     if (state === 'idle' || state === 'connecting') return { pending: true, error: `node_link_${state}` }
     return { ok: false, error: `node_link_${state}` }
   },
+  canUseManagedProxy: (vmId) => !getVm(cfg.paths.project, vmId)?.node_id,
   onDisableVm: (vmId, reason, proxyId) => {
-    setVmSchedulable(cfg.paths.project, vmId, false, `${reason}|proxy=${proxyId}`)
+    disableVmForProxy(cfg.paths.project, vmId, reason, proxyId)
   },
   onDisconnectVm: (vmId, reason, proxyId) => {
     setVmSchedulable(cfg.paths.project, vmId, false, `${reason}|proxy=${proxyId}`)
@@ -367,6 +370,8 @@ proxyPool = new ProxyPool({
   egressCheck: (proxy) => proxyEgressReady(proxy, cfg.paths.project),
   repairEgress: (proxy) => ensureProxyEgress(cfg.paths.project, proxy),
 })
+const mihomo = new MihomoManager({ dataDir, proxyPool })
+await mihomo.restore()
 proxyPool.startScheduler()
 
 // 首次安装的出口池是空的，槽没有可绑出口就起不来。本机出口永远成立，先补上。
@@ -535,6 +540,7 @@ const backupService = new BackupService({
   dataDir,
   projectRoot: cfg.paths.project,
   configDir: path.dirname(routingConfigPath),
+  mihomo,
 })
 backupService.onRestored((db) => {
   // A restore swaps the DatabaseSync instance and routing files. Rebuild every
@@ -897,6 +903,7 @@ cliNodeGuard = createCliNodeGuard({
 })
 
 const handlePanel = createPanelHandler({
+  mihomo,
   json,
   writeSSEHeaders,
   readBody,
@@ -987,7 +994,11 @@ const server = http.createServer(async (req, res) => {
 
     if (
       backupService.isRestoring &&
-      (p.startsWith('/v1/') || p === '/messages' || p === '/chat/completions' || p === '/responses')
+      (p.startsWith('/api/panel') ||
+        p.startsWith('/v1/') ||
+        p === '/messages' ||
+        p === '/chat/completions' ||
+        p === '/responses')
     ) {
       return json(
         res,
@@ -1178,10 +1189,11 @@ process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
 
 // Graceful shutdown: stop schedulers/watchers, close the DB (WAL checkpoint).
 let _shuttingDown = false
-function shutdown(signal) {
+async function shutdown(signal) {
   if (_shuttingDown) return
   _shuttingDown = true
   console.log(`[shutdown] ${signal} — closing`)
+  await mihomo.close()
   try {
     backupService.stopScheduler()
   } catch {}

@@ -4,6 +4,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { managedNodeId } from '../mihomo/manager.mjs'
 import {
   verifyPanelLogin,
   createPanelSession,
@@ -1135,6 +1136,26 @@ export function createPanelHandler(ctx) {
       ) {
         return true
       }
+      if (p === '/api/panel/mihomo') {
+        if (!ctx.mihomo) return json(res, 503, { ok: false, error: { message: 'Mihomo 管理器不可用' } })
+        try {
+          if (req.method === 'GET') return json(res, 200, panel.ok(ctx.mihomo.status()))
+          if (req.method === 'POST') {
+            const body = await readBody(req, 256 * 1024)
+            const result =
+              body.action === 'test' || body.action === 'quality'
+                ? await ctx.mihomo.test(body.id, body.action === 'quality')
+                : await ctx.mihomo.perform(body)
+            return json(res, 200, panel.ok(result))
+          }
+          return json(res, 405, { ok: false, error: { message: '不支持此方法' } })
+        } catch (error) {
+          return json(res, error.status || 500, {
+            ok: false,
+            error: { code: error.code || 'mihomo_failed', message: error.status ? error.message : 'Mihomo 操作失败' },
+          })
+        }
+      }
       if ((req.method === 'GET' || req.method === 'PUT') && p === '/api/panel/onboarding') {
         if (req.method === 'PUT') {
           const body = await readBody(req, 4096).catch(() => ({}))
@@ -1842,7 +1863,7 @@ export function createPanelHandler(ctx) {
           })
         }
         try {
-          const out = backupService.restoreBackup(id)
+          const out = await backupService.restoreBackup(id)
           return json(res, 200, { ok: true, ...out })
         } catch (e) {
           const map = {
@@ -1851,6 +1872,8 @@ export function createPanelHandler(ctx) {
             restore_in_progress: 409,
             backup_corrupt: 422,
             backup_not_ok: 422,
+            backup_mihomo_missing: 422,
+            busy: 409,
           }
           return json(res, map[e.code] || 500, {
             ok: false,
@@ -5098,7 +5121,15 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/enable$/.test(p)) {
         const id = p.split('/')[4]
-        const result = proxyPool.setEnabled(id, true)
+        let result
+        try {
+          result = managedNodeId(id) ? await ctx.mihomo.setProxyEnabled(id, true) : proxyPool.setEnabled(id, true)
+        } catch (error) {
+          return json(res, error.status || 500, {
+            ok: false,
+            error: { message: error.status ? error.message : 'Mihomo 操作失败' },
+          })
+        }
         if (!result.ok)
           return json(res, 404, {
             ok: false,
@@ -5117,7 +5148,15 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/disable$/.test(p)) {
         const id = p.split('/')[4]
-        const result = proxyPool.setEnabled(id, false)
+        let result
+        try {
+          result = managedNodeId(id) ? await ctx.mihomo.setProxyEnabled(id, false) : proxyPool.setEnabled(id, false)
+        } catch (error) {
+          return json(res, error.status || 500, {
+            ok: false,
+            error: { message: error.status ? error.message : 'Mihomo 操作失败' },
+          })
+        }
         if (!result.ok)
           return json(res, 404, {
             ok: false,
@@ -5195,7 +5234,17 @@ export function createPanelHandler(ctx) {
         const id = p.split('/').pop()
         const snap = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
         const targets = snap?.bound_vm_ids?.length ? snap.bound_vm_ids : snap?.bound_vm_id ? [snap.bound_vm_id] : []
-        const result = proxyPool.remove(id)
+        if (managedNodeId(id)) {
+          try {
+            await ctx.mihomo.perform({ action: 'node_unexport', id: managedNodeId(id) })
+          } catch (error) {
+            return json(res, error.status || 500, {
+              ok: false,
+              error: { message: error.status ? error.message : 'Mihomo 操作失败' },
+            })
+          }
+        }
+        const result = managedNodeId(id) ? { ok: true, removed: snap } : proxyPool.remove(id)
         if (!result.ok)
           return json(res, 404, {
             ok: false,

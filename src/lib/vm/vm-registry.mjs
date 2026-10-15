@@ -489,6 +489,12 @@ export function setVmSchedulable(
   return summarizeVm(vm)
 }
 
+export function disableVmForProxy(projectRoot, id, reason, proxyId) {
+  const vm = getVm(projectRoot, id)
+  if (String(proxyId).startsWith('px-mh-') && vm?.schedulable === false) return vm
+  return setVmSchedulable(projectRoot, id, false, reason + '|proxy=' + proxyId)
+}
+
 export function bindVmProxy(projectRoot, id, proxyInfo) {
   const file = path.join(projectRoot, 'vms', `${id}.json`)
   if (!fs.existsSync(file)) return null

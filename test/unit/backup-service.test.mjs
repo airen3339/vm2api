@@ -3,11 +3,15 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import zlib from 'node:zlib'
+import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { openDatabase, closeDatabase, getDb } from '../../src/lib/db/database.mjs'
+import { openDatabase, closeDatabase, getDb, vacuumInto } from '../../src/lib/db/database.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
 import { BackupService, tarAvailable } from '../../src/lib/admin/backup-service.mjs'
+import { MihomoManager, managedProxyId } from '../../src/lib/mihomo/manager.mjs'
+import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { stopVmWatch, initVmDbSync } from '../../src/lib/vm/vm-db-sync.mjs'
 import { setVmWriteHook } from '../../src/lib/vm/vm-file.mjs'
@@ -86,7 +90,7 @@ test('createBackup produces tar.gz with manifest + db + vms + config, records ok
   fs.rmSync(tmp, { recursive: true, force: true })
 })
 
-test('restoreBackup rolls data back and creates pre_restore record', () => {
+test('restoreBackup rolls data back and creates pre_restore record', async () => {
   seedVm()
   initVmDbSync(root, { watch: false })
   const keys = new ApiKeyStore({ db: getDb() })
@@ -104,7 +108,7 @@ test('restoreBackup rolls data back and creates pre_restore record', () => {
     keys.rebind(db)
   })
 
-  const out = svc.restoreBackup(rec.id)
+  const out = await svc.restoreBackup(rec.id)
   assert.equal(out.ok, true)
   assert.ok(reboundDb, 'rebind callback should fire')
 
@@ -134,26 +138,26 @@ test('restoreBackup rolls data back and creates pre_restore record', () => {
   )
 })
 
-test('restore fails when stores cannot rebind to the reopened database', () => {
+test('restore fails when stores cannot rebind to the reopened database', async () => {
   seedVm()
   const rec = svc.createBackup({ kind: 'manual' })
   svc.onRestored(() => {
     throw new Error('store rebind failed')
   })
 
-  assert.throws(() => svc.restoreBackup(rec.id), /store rebind failed/)
+  await assert.rejects(() => svc.restoreBackup(rec.id), /store rebind failed/)
   assert.equal(svc.isRestoring, false)
   assert.doesNotThrow(() => getDb().prepare('SELECT 1').get())
 })
 
-test('restore rebuilds vm files from DB mirror for db-only path', () => {
+test('restore rebuilds vm files from DB mirror for db-only path', async () => {
   seedVm('vm-b2')
   initVmDbSync(root, { watch: false })
   const rec = svc.createBackup({ kind: 'manual' })
 
   // delete vm file + its row is still in backup db; also delete local file post-backup
   fs.rmSync(path.join(root, 'vms', 'vm-b2.json'))
-  const out = svc.restoreBackup(rec.id)
+  const out = await svc.restoreBackup(rec.id)
   assert.equal(out.ok, true)
   const back = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-b2.json'), 'utf8'))
   // tar snapshot still has the on-disk file from backup time; DB is metadata only.
@@ -164,11 +168,11 @@ test('restore rebuilds vm files from DB mirror for db-only path', () => {
   assert.equal(row.vm.claude.access_token, undefined)
 })
 
-test('sha256 tamper detection blocks restore', () => {
+test('sha256 tamper detection blocks restore', async () => {
   seedVm()
   const rec = svc.createBackup({ kind: 'manual' })
   fs.appendFileSync(rec.file_path, 'tamper')
-  assert.throws(() => svc.restoreBackup(rec.id), /sha256 mismatch/)
+  await assert.rejects(() => svc.restoreBackup(rec.id), /sha256 mismatch/)
 })
 
 test('retention prunes old backups', () => {
@@ -216,4 +220,147 @@ test('remove deletes record + file', () => {
   assert.equal(svc.remove(rec.id), true)
   assert.equal(fs.existsSync(rec.file_path), false)
   assert.equal(svc.get(rec.id), null)
+})
+
+function managedBackup(t) {
+  const pool = new ProxyPool({ db: getDb() })
+  const runtime = {
+    installed: true,
+    running: false,
+    async start(config) {
+      this.running = true
+      this.config = config
+    },
+    async stop() {
+      this.running = false
+    },
+    async apply(config) {
+      this.config = config
+    },
+  }
+  const manager = new MihomoManager({ dataDir, proxyPool: pool, runtime })
+  svc.mihomo = manager
+  svc.onRestored((db) => pool.rebind(db))
+  t.after(async () => {
+    await manager.close()
+    pool.stopScheduler()
+  })
+  return { manager, pool, runtime }
+}
+
+test('restore replaces live Mihomo settings, listeners, pool and cached checks together', async (t) => {
+  const { manager, pool, runtime } = managedBackup(t)
+  await manager.perform({ action: 'dynamic_add', text: 'http://first.example:8000#first' })
+  await manager.perform({ action: 'start' })
+  const id = manager.status().nodes[0].id
+  await manager.perform({ action: 'node_export', id })
+  pool.bind(managedProxyId(id), 'slot-before')
+  const binding = structuredClone(manager.state.bindings[id])
+  const rec = svc.createBackup()
+  await manager.perform({ action: 'dynamic_add', text: 'http://second.example:8000#second' })
+  await manager.perform({ action: 'stop' })
+  manager.checks.set(id, { success: false })
+  assert.equal((await svc.restoreBackup(rec.id)).ok, true)
+  assert.equal(manager.status().sources.length, 1)
+  assert.equal(runtime.running, true)
+  assert.deepEqual(manager.state.bindings[id], binding)
+  assert.equal(runtime.config.listeners.find((l) => l.name === id).port, binding.port)
+  assert.equal(manager.checks.size, 0)
+  assert.deepEqual(pool.snapshot().proxies[0].bound_vm_ids, ['slot-before'])
+  assert.equal(new SettingsRepo(getDb()).has('backup_mihomo_state'), false)
+})
+
+test('db-only gzip fallback also restores Mihomo state', async (t) => {
+  const { manager, runtime } = managedBackup(t)
+  await manager.perform({ action: 'dynamic_add', text: 'http://first.example:8000' })
+  const oldPath = process.env.PATH
+  let rec
+  try {
+    process.env.PATH = ''
+    rec = svc.createBackup()
+  } finally {
+    process.env.PATH = oldPath
+  }
+  assert.ok(rec.file_name.endsWith('.db.gz'))
+  await manager.perform({ action: 'start' })
+  await manager.perform({ action: 'source_rename', id: manager.state.sources[0].id, label: 'changed' })
+  await svc.restoreBackup(rec.id)
+  assert.equal(runtime.running, false)
+  assert.notEqual(manager.state.sources[0].label, 'changed')
+})
+
+test('restoring a backup without Mihomo removes post-backup sources and outlets', async (t) => {
+  const { manager, pool, runtime } = managedBackup(t)
+  const rec = svc.createBackup()
+  await manager.perform({ action: 'dynamic_add', text: 'http://later.example:8000' })
+  await manager.perform({ action: 'start' })
+  await manager.perform({ action: 'node_export', id: manager.status().nodes[0].id })
+  await svc.restoreBackup(rec.id)
+  assert.equal(manager.state.sources.length, 0)
+  assert.equal(pool.snapshot().proxies.length, 0)
+  assert.equal(runtime.running, false)
+})
+
+test('backup restoration rejects active management and waits for active checks', async (t) => {
+  const { manager } = managedBackup(t)
+  await manager.perform({ action: 'dynamic_add', text: 'http://first.example:8000' })
+  const rec = svc.createBackup()
+  let release
+  const work = manager.exclusive(
+    () =>
+      new Promise((resolve) => {
+        release = resolve
+      }),
+  )
+  await assert.rejects(svc.restoreBackup(rec.id), { code: 'busy' })
+  release()
+  await work
+  let finish
+  manager.probeImpl = () =>
+    new Promise((resolve) => {
+      finish = resolve
+    })
+  const check = manager.test(manager.status().nodes[0].id)
+  const restoring = svc.restoreBackup(rec.id)
+  assert.equal(svc.isRestoring, true)
+  await assert.rejects(manager.test(manager.status().nodes[0].id), { code: 'busy' })
+  finish({ success: true, latency_ms: 1 })
+  await check
+  await restoring
+  assert.equal(svc.isRestoring, false)
+  assert.equal(manager.checks.size, 0)
+})
+
+test('legacy backups containing managed proxies without Mihomo settings are rejected before stopping', async (t) => {
+  const { manager, runtime } = managedBackup(t)
+  await manager.perform({ action: 'dynamic_add', text: 'http://first.example:8000' })
+  await manager.perform({ action: 'start' })
+  await manager.perform({ action: 'node_export', id: manager.status().nodes[0].id })
+  const rec = svc.createBackup()
+  const snapshot = path.join(root, 'legacy.db')
+  vacuumInto(getDb(), snapshot)
+  const archive = path.join(root, 'legacy.db.gz')
+  fs.writeFileSync(archive, zlib.gzipSync(fs.readFileSync(snapshot)))
+  const hash = createHash('sha256').update(fs.readFileSync(archive)).digest('hex')
+  getDb()
+    .prepare('UPDATE backup_records SET file_path=?, file_name=?, sha256=? WHERE id=?')
+    .run(archive, 'legacy.db.gz', hash, rec.id)
+  await assert.rejects(svc.restoreBackup(rec.id), { code: 'backup_mihomo_missing' })
+  assert.equal(runtime.running, true)
+})
+
+test('Mihomo file checksum is verified before restoring state', async (t) => {
+  const { manager, runtime } = managedBackup(t)
+  await manager.perform({ action: 'dynamic_add', text: 'http://first.example:8000' })
+  await manager.perform({ action: 'start' })
+  const rec = svc.createBackup()
+  const unpacked = path.join(root, 'unpacked')
+  fs.mkdirSync(unpacked)
+  assert.equal(spawnSync('tar', ['-xzf', rec.file_path, '-C', unpacked]).status, 0)
+  fs.appendFileSync(path.join(unpacked, 'mihomo', 'settings.json'), ' ')
+  assert.equal(spawnSync('tar', ['-czf', rec.file_path, '-C', unpacked, '.']).status, 0)
+  const hash = createHash('sha256').update(fs.readFileSync(rec.file_path)).digest('hex')
+  getDb().prepare('UPDATE backup_records SET sha256=? WHERE id=?').run(hash, rec.id)
+  await assert.rejects(svc.restoreBackup(rec.id), { code: 'backup_corrupt' })
+  assert.equal(runtime.running, true)
 })

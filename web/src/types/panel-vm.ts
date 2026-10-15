@@ -31,6 +31,7 @@ export type ProxyGeo = {
 }
 
 export type VmProxySnap = {
+  managed?: boolean
   id?: string
   host?: string
   port?: number | string

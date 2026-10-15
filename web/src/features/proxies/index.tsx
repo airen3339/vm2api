@@ -2,8 +2,9 @@ import { useCallback, useDeferredValue, useMemo, useState } from 'react'
 import { useMutation, useMutationState, useQuery } from '@tanstack/react-query'
 import { VIEW_TITLES } from '@/config/nav'
 import type { Vm, VmProxySnap } from '@/types/panel-vm'
-import { Plus, Settings2 } from 'lucide-react'
+import { ChevronDown, Plus, Settings2 } from 'lucide-react'
 import { toast } from 'sonner'
+import { useAuthStore } from '@/stores/auth-store'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -19,6 +20,7 @@ import { PageHeader } from '@/components/page-header'
 import { SectionSkeleton } from '@/components/page-skeletons'
 import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { MihomoPanel } from './mihomo-panel'
 import { ProxyBulkActions } from './proxy-bulk-actions'
 import { ProxyEditDialog } from './proxy-edit-dialog'
 import { createProxyHover } from './proxy-hover'
@@ -91,6 +93,9 @@ function firstOf(set: Set<string>): string {
 }
 
 export function ProxiesPage() {
+  const admin = useAuthStore((s) => s.me?.role === 'admin')
+  const [mihomoOpen, setMihomoOpen] = useState(false)
+  const [mihomoMounted, setMihomoMounted] = useState(false)
   const px = useQuery(proxiesQueryOptions())
   const dash = useQuery(dashboardQueryOptions())
   const refresh = useRefreshProxies()
@@ -116,6 +121,9 @@ export function ProxiesPage() {
   const deferredQuery = useDeferredValue(query.trim().toLowerCase())
 
   const list = useMemo(() => px.data?.proxies || [], [px.data?.proxies])
+  const poolError =
+    px.error || (px.data?.error ? new Error(px.data.error) : null)
+  const hasPoolData = Array.isArray(px.data?.proxies) && !px.data?.error
   const tot = px.data?.totals || {}
   const cfg = px.data?.config || {}
   const vms: Vm[] = useMemo(() => dash.data?.vms || [], [dash.data?.vms])
@@ -340,6 +348,27 @@ export function ProxiesPage() {
       title={VIEW_TITLES.proxies}
       extra={
         <div className='flex flex-wrap items-center gap-2'>
+          {admin && (
+            <Button
+              variant={mihomoOpen ? 'secondary' : 'outline'}
+              size='sm'
+              aria-expanded={mihomoOpen}
+              aria-controls='mihomo-subscriptions'
+              onClick={() => {
+                setMihomoMounted(true)
+                setMihomoOpen((open) => !open)
+              }}
+            >
+              Mihomo 订阅
+              <span className='text-xs text-muted-foreground'>
+                {mihomoOpen ? '收起' : '展开'}
+              </span>
+              <ChevronDown
+                className={cn(mihomoOpen && 'rotate-180')}
+                aria-hidden='true'
+              />
+            </Button>
+          )}
           <ProxyBulkActions empty={!list.length} />
           <Button
             variant='outline'
@@ -361,7 +390,7 @@ export function ProxiesPage() {
     >
       <QueryGate
         loading={px.isLoading}
-        error={px.error || (px.data?.error ? new Error(px.data.error) : null)}
+        error={hasPoolData ? null : poolError}
         skeleton={
           <div className='space-y-4'>
             <SectionSkeleton
@@ -385,6 +414,27 @@ export function ProxiesPage() {
         }
       >
         <div className='space-y-4'>
+          {hasPoolData && poolError && (
+            <div
+              role='alert'
+              className='flex flex-wrap items-center justify-between gap-2 rounded-lg border border-destructive/50 p-3 text-sm'
+            >
+              <p>代理池刷新失败，显示上次数据：{poolError.message}</p>
+              <Button
+                size='sm'
+                variant='outline'
+                disabled={px.isFetching}
+                onClick={() => void px.refetch()}
+              >
+                重试刷新
+              </Button>
+            </div>
+          )}
+          {admin && (
+            <div id='mihomo-subscriptions' hidden={!mihomoOpen}>
+              {mihomoMounted && <MihomoPanel />}
+            </div>
+          )}
           <ProxyOverview
             proxies={sorted}
             vms={vms}
