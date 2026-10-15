@@ -524,7 +524,7 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {})
     request_timeout_seconds: 0,
     first_byte_timeout_seconds: 600,
     idle_timeout_seconds: Math.ceil(streamIdleTimeoutMs(resolvedRouting) / 1000),
-    max_request_bytes: 32 * 1024 * 1024,
+    max_request_bytes: 64 * 1024 * 1024,
     max_response_bytes: 64 * 1024 * 1024,
     max_event_bytes: 32 * 1024 * 1024,
     test_endpoints: testEndpoints,

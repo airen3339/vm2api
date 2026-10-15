@@ -165,7 +165,7 @@ func (c *Config) applyDefaults() {
 		c.IdleTimeoutSecs = DefaultIdleTimeoutSecs
 	}
 	if c.MaxRequestBytes <= 0 {
-		c.MaxRequestBytes = 32 << 20
+		c.MaxRequestBytes = 64 << 20
 	}
 	if c.MaxResponseBytes <= 0 {
 		c.MaxResponseBytes = 64 << 20

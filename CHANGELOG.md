@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Codex / 槽位内核入站请求体上限由 32 MiB 提到 64 MiB（`max_request_bytes` 默认值与写入 Codex / Claude kernel 配置一致），修复大上下文请求在 kernel 层 413（`Failed to buffer the request body: length limit exceeded`）。（#436）
+
 ## 1.3.170 — 2026-10-15
 
 - 本地代理拆成每台 VPS 一条：控制面 `px-local`，每个集群节点 `px-local-<节点 id>`，接入节点时自动建立。绑定额度、测通、测地理都按各自机器算，不再「所有节点共用」，节点行的探测看该节点的 SSH 链路，地理经节点本机出网查询。槽位只能绑它所在机器的本地代理，传通用的 `px-local` 会自动落到槽位自己机器的那一行，绑到别的机器返回 `local_proxy_node_mismatch`。升级后首次启动会把挂在 `px-local` 上的节点槽迁到各自节点的行，docker 网络不变，运行中的槽不用重建。（#329，#428）

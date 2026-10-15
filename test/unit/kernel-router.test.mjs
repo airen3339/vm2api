@@ -631,6 +631,7 @@ test('writeKernelConfig separates container paths from host socket paths', () =>
   assert.equal(doc.https_proxy, undefined)
   assert.equal(doc.slots_per_worker, WRAP_SLOT_MAX)
   assert.equal(doc.default_cache_ttl, '1h')
+  assert.equal(doc.max_request_bytes, 64 * 1024 * 1024)
   assert.match(written.socketPath.replace(/\\/g, '/'), /vms\/vm-09\/run\/kernel\.sock$/)
   assert.equal(fs.readFileSync(written.tokenPath, 'utf8').trim(), 'tok')
   const exec = { vmId: 'vm-09', homeDir: path.join(root, 'vms', 'vm-09', 'cli-home'), vm: { id: 'vm-09' } }
