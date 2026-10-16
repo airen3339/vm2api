@@ -409,9 +409,13 @@ Claude 槽测试走官方 CC 入站（`/v1/messages`）。GPT/Codex 槽测试走
 
 地理查询的 SOCKS5 目标域名统一由代理端解析（包括 `socks5://` 输入），避免依赖控制面的本地 DNS；IPv4 查询和 IPv6 两阶段探测使用相同策略。此规则仅作用于地理查询，不修改保存的代理 URI 或其它请求的 DNS 策略。HTTP(S) 代理和本地直连行为不变。
 
-经该代理本身去查出口 IP 的国家 / 城市 / 时区（本地出口走宿主机默认路由）。IPv4 结果落在 `proxies.geo_*` 列，IPv6 公网出口落在 `proxies.geo_v6_*` 列；列表响应分别回显 `geo` 与 `geo_v6`。IPv6 探测先经仅 AAAA 的 IP 探针（默认 `https://ipv6.icanhazip.com`，可用 `KIN_PROXY_GEO_V6_IP_URL` 覆盖）确认出口为 IPv6，再查该地址的地理信息；探针若返回 IPv4 记 `geo_v6.error=geo_ipv6_got_ipv4`，无 IPv6 出口时记传输 / HTTP 错误，不会把 IPv4 结果写入 `geo_v6`。单条 IPv4 成功后，已绑槽位在 `follow_proxy_timezone` 开启且未被手动钉住时会改用该时区（仍跟随 IPv4 出口时区，不用 IPv6 覆盖）。
+经该代理本身去查出口 IP 的国家 / 城市 / 时区（本地出口走宿主机默认路由）。主查询结果落在 `proxies.geo_*` 列，独立的 IPv6 公网出口探测落在 `proxies.geo_v6_*` 列；列表响应分别回显 `geo` 与 `geo_v6`。IPv6 探测先经仅 AAAA 的 IP 探针（默认 `https://ipv6.icanhazip.com`，可用 `KIN_PROXY_GEO_V6_IP_URL` 覆盖）确认出口为 IPv6，再查该地址的地理信息；探针若返回 IPv4 记 `geo_v6.error=geo_ipv6_got_ipv4`，无 IPv6 出口时记传输 / HTTP 错误，不会把 IPv4 结果写入 `geo_v6`。主查询成功后，已绑槽位在 `follow_proxy_timezone` 开启且未被手动钉住时会改用该时区；独立的 `geo_v6` 结果不覆盖它。
 
-响应 `{ proxy, geo, geo_v6, cached, timezones }`（单条）或 `{ total, results }`（批量，每项含 `geo_v6`）。错误：`404 proxy_not_found`、`502 geo_lookup_failed`（IPv4 查询失败时 HTTP 502；IPv6 不可用时在 `geo_v6.error` 中体现，单条请求仍可能 HTTP 200）。`force: true` 忽略缓存重查。
+仅 IPv6 出口可能无法访问默认地理服务 `ip-api.com` 的 IPv4 接口。可在控制面 `.env` 设置 `KIN_PROXY_GEO_V6_LOOKUP_MODE=control-plane` 并重新创建控制面容器（直接运行时重启对应进程）：IPv6 IP 探针仍经所选代理访问（包括代理认证），只有确认 IPv6 后的地理元数据查询走控制面默认路由。此模式会向地理服务提交已确认的出口 IPv6；槽位业务流量的出口不受影响。默认值 `proxy` 保持两个阶段都经代理，IPv6 查询收到其它模式值时返回 `geo_ipv6_invalid_lookup_mode`。
+
+启用 `control-plane` 后，主查询访问默认 `KIN_PROXY_GEO_URL` 发生传输错误时，也会尝试上述 IPv6 探测与元数据查询，成功结果写入 `geo`，因此主结果可能是 IPv6。HTTP / 服务商错误及自定义主查询 URL 不触发该回退。IPv6 元数据默认查询 `http://ip-api.com/json/{ip}?fields=...`；可用 `KIN_PROXY_GEO_V6_URL` 指定 URL，其中 `{ip}` 会替换为探针确认的地址（URL 编码）。响应必须包含相同的 IPv6（允许等价的缩写 / 展开形式）；返回 IPv4 记 `geo_ipv6_got_ipv4`，缺失或不匹配记 `geo_ipv6_ip_mismatch`，不会把控制面自身的 IP 当成代理出口。
+
+响应 `{ proxy, geo, geo_v6, cached, timezones }`（单条）或 `{ total, results }`（批量，每项含 `geo_v6`）。错误：`404 proxy_not_found`、`502 geo_lookup_failed`（主查询失败时 HTTP 502；独立 IPv6 探测不可用时在 `geo_v6.error` 中体现，单条请求仍可能 HTTP 200）。`force: true` 忽略缓存重查。
 
 ### `PUT /proxies/:id`
 

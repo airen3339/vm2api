@@ -9,12 +9,16 @@ for (const scheme of ['socks5', 'socks5h', 'http', 'https', '']) {
   test(`geo DNS policy: ${scheme || 'direct'}`, async () => {
     const url = scheme ? `${scheme}://127.0.0.1:1080` : ''
     const agents = []
-    const fetchImpl = async (endpoint, { agent }) => {
-      agents.push(agent)
+    const fetchImpl = async (endpoint, opts) => {
+      agents.push(opts?.agent)
+      const acceptHdr = String(opts?.headers?.accept || '')
+      if (acceptHdr.includes('text/plain') || String(endpoint).includes('icanhazip')) {
+        return { ok: true, text: async () => '2001:db8::1' }
+      }
+      const query = String(endpoint).includes('2001') ? '2001:db8::1' : '203.0.113.1'
       return {
         ok: true,
-        text: async () => '2001:db8::1',
-        json: async () => ({ status: 'success', query: '203.0.113.1', timezone: 'Asia/Tokyo' }),
+        json: async () => ({ status: 'success', query, timezone: 'Asia/Tokyo' }),
       }
     }
     assert.equal((await lookupProxyGeo(url, { fetchImpl })).ok, true)
