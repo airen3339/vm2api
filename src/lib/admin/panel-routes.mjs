@@ -748,6 +748,7 @@ export function createPanelHandler(ctx) {
         scope: body?.scope,
         vmIds: body?.vm_ids,
         schedule: body?.schedule,
+        test: body?.test ?? null,
       })
       return json(res, 200, panel.ok(result))
     } catch (error) {

@@ -534,7 +534,7 @@ function VmDetailBody({
               credType={credType}
               isCodex={isCodexVm(vm)}
               dataplane={vm.resolved_dataplane}
-              schedule={<VmTestSchedule vm={vm} {...test} />}
+              schedule={<VmTestSchedule key={vm.id} vm={vm} {...test} />}
             />
           ) : null}
           {perms.admin ? (
