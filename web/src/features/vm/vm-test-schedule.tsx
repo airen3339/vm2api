@@ -33,7 +33,7 @@ import { TimezonePicker } from '@/features/vm/timezone-picker'
 
 type ScheduleFrequency = 'hourly' | 'daily' | 'weekly'
 
-type TestSchedule = {
+export type TestSchedule = {
   enabled: boolean
   frequency: ScheduleFrequency
   minute?: number
@@ -53,7 +53,7 @@ type TestSchedule = {
   running: boolean
 }
 
-type ScheduleStructure = Pick<
+export type ScheduleStructure = Pick<
   TestSchedule,
   'frequency' | 'minute' | 'time' | 'weekdays' | 'timezone'
 >
@@ -132,6 +132,56 @@ function structureFromSchedule(
   }
 }
 
+export type FormState = {
+  enabled: boolean
+  structure: ScheduleStructure
+  model: string
+  prompt: string
+  maxTokens: number
+  reasoningEffort: string
+  codex: boolean
+}
+
+/**
+ * A refreshed plan: unchanged → keep; form already shows it → track; form
+ * untouched since the last load → adopt; user is editing → stale (warn, never overwrite).
+ */
+export function reconcileSchedule(
+  form: FormState,
+  base: TestSchedule | null,
+  schedule: TestSchedule
+): 'keep' | 'track' | 'adopt' | 'stale' {
+  if (base && formShows(formFrom(base), schedule)) return 'keep'
+  if (formShows(form, schedule)) return 'track'
+  if (!base || formShows(form, base)) return 'adopt'
+  return 'stale'
+}
+
+function formFrom(schedule: TestSchedule): FormState {
+  return {
+    enabled: schedule.enabled,
+    structure: structureFromSchedule(schedule),
+    model: schedule.model,
+    prompt: schedule.prompt,
+    maxTokens: schedule.max_tokens ?? 0,
+    reasoningEffort: schedule.reasoning_effort ?? '',
+    codex: schedule.reasoning_effort != null,
+  }
+}
+
+/** True when the form still shows exactly this stored plan. */
+function formShows(form: FormState, schedule: TestSchedule) {
+  return (
+    form.enabled === schedule.enabled &&
+    structureEqual(form.structure, structureFromSchedule(schedule)) &&
+    form.model === schedule.model &&
+    form.prompt.trim() === schedule.prompt &&
+    (form.codex
+      ? form.reasoningEffort === schedule.reasoning_effort
+      : form.maxTokens === schedule.max_tokens)
+  )
+}
+
 function structureEqual(a: ScheduleStructure, b: ScheduleStructure) {
   return (
     a.frequency === b.frequency &&
@@ -162,6 +212,9 @@ export function VmTestSchedule({
   const queryKey = ['panel', 'vm', vm.id, 'test-schedule'] as const
   const endpoint = `/api/panel/vms/${encodeURIComponent(vm.id)}/test-schedule`
   const loaded = useRef(false)
+  // The stored plan the form was last filled from; later refreshes compare against it.
+  const base = useRef<TestSchedule | null>(null)
+  const [stale, setStale] = useState(false)
   const [enabled, setEnabled] = useState(false)
   const [structure, setStructure] =
     useState<ScheduleStructure>(defaultStructure)
@@ -175,8 +228,8 @@ export function VmTestSchedule({
         { signal }
       ),
     retry: false,
-    refetchInterval: (query) =>
-      query.state.data?.schedule?.enabled ? 30_000 : false,
+    // Another tab, another admin or "sync to all" may change this plan while it is open.
+    refetchInterval: 30_000,
   })
   const defaultQuery = useQuery({
     queryKey: ['panel', 'test-schedule', 'default'] as const,
@@ -186,22 +239,48 @@ export function VmTestSchedule({
   })
   const saved = scheduleQuery.data?.schedule || null
 
+  const selectedModel = model || models[0]?.id || ''
+  const form: FormState = {
+    enabled,
+    structure,
+    model: selectedModel,
+    prompt,
+    maxTokens,
+    reasoningEffort,
+    codex,
+  }
+  const adopt = (schedule: TestSchedule) => {
+    base.current = schedule
+    setStale(false)
+    setEnabled(schedule.enabled)
+    setStructure(structureFromSchedule(schedule))
+    onLoadSchedule(schedule)
+  }
+
   useEffect(() => {
-    if (loaded.current || !scheduleQuery.data) return
-    loaded.current = true
+    if (!scheduleQuery.data) return
     const schedule = scheduleQuery.data.schedule
-    if (!schedule) {
-      if (defaultQuery.data?.schedule) {
+    if (!loaded.current) {
+      loaded.current = true
+      if (schedule) adopt(schedule)
+      else if (defaultQuery.data?.schedule) {
         setStructure(structureFromSchedule(defaultQuery.data.schedule))
       }
       return
     }
-    setEnabled(schedule.enabled)
-    setStructure(structureFromSchedule(schedule))
-    onLoadSchedule(schedule)
-  }, [defaultQuery.data?.schedule, onLoadSchedule, scheduleQuery.data])
+    if (!schedule) {
+      base.current = null
+      return
+    }
+    const action = reconcileSchedule(form, base.current, schedule)
+    if (action === 'track') {
+      base.current = schedule
+      setStale(false)
+    } else if (action === 'adopt') adopt(schedule)
+    else if (action === 'stale') setStale(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- re-run on new data, not on each keystroke
+  }, [defaultQuery.data?.schedule, scheduleQuery.data])
 
-  const selectedModel = model || models[0]?.id || ''
   const savedStructure = useMemo(
     () => (saved ? structureFromSchedule(saved) : null),
     [saved]
@@ -235,6 +314,8 @@ export function VmTestSchedule({
     onSuccess: (data) => {
       qc.setQueryData(queryKey, data)
       if (data.schedule) {
+        base.current = data.schedule
+        setStale(false)
         setEnabled(data.schedule.enabled)
         setStructure(structureFromSchedule(data.schedule))
         onPromptChange(data.schedule.prompt)
@@ -251,6 +332,8 @@ export function VmTestSchedule({
     mutationFn: () => api<SchedulePayload>(endpoint, { method: 'DELETE' }),
     onSuccess: (data) => {
       qc.setQueryData(queryKey, data)
+      base.current = null
+      setStale(false)
       setEnabled(false)
       setStructure(defaultStructure())
       toast.success('测试计划已删除')
@@ -278,11 +361,33 @@ export function VmTestSchedule({
           scope,
           ...(scope === 'ids' ? { vm_ids: [vm.id] } : {}),
           schedule: structure,
+          // "All slots" copies the whole scheduled test, switch included.
+          ...(scope === 'all'
+            ? {
+                test: {
+                  enabled,
+                  model: selectedModel,
+                  prompt: prompt.trim(),
+                  ...(codex
+                    ? { reasoning_effort: reasoningEffort }
+                    : { max_tokens: maxTokens }),
+                },
+              }
+            : {}),
         }),
       }),
-    onSuccess: (data) => {
-      toast.success(`已覆盖 ${data.updated.length} 个槽的调度时间`)
-      void scheduleQuery.refetch()
+    onSuccess: (data, scope) => {
+      toast.success(
+        scope === 'all'
+          ? `已把定时测试同步到 ${data.updated.length} 个槽`
+          : `已覆盖 ${data.updated.length} 个槽的调度时间`
+      )
+      void qc.invalidateQueries({
+        predicate: (query) =>
+          query.queryKey[0] === 'panel' &&
+          query.queryKey[1] === 'vm' &&
+          query.queryKey[3] === 'test-schedule',
+      })
     },
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => {
@@ -324,6 +429,24 @@ export function VmTestSchedule({
           />
         </div>
       </div>
+
+      {stale ? (
+        <div
+          className='flex items-center gap-2 text-xs text-amber-600'
+          role='alert'
+        >
+          <span>此槽的计划已在别处修改，保存会覆盖它。</span>
+          <Button
+            size='sm'
+            variant='ghost'
+            onClick={() =>
+              scheduleQuery.data?.schedule && adopt(scheduleQuery.data.schedule)
+            }
+          >
+            载入最新
+          </Button>
+        </div>
+      ) : null}
 
       {scheduleQuery.isPending ? (
         <p className='text-xs text-muted-foreground'>正在读取计划…</p>
@@ -490,7 +613,7 @@ export function VmTestSchedule({
             <Button
               size='sm'
               variant='outline'
-              disabled={busy}
+              disabled={busy || !selectedModel || !prompt.trim()}
               onClick={() => setSyncAllOpen(true)}
             >
               同步到全部槽
@@ -568,9 +691,12 @@ export function VmTestSchedule({
           <AlertDialogHeader>
             <AlertDialogTitle>同步到全部槽？</AlertDialogTitle>
             <AlertDialogDescription>
-              将把当前表单的调度时间覆盖写入你有权限的全部槽（租户仅自己的槽）。
-              无计划的槽会创建且保持关闭；Prompt、模型、token/effort
-              与启用开关不会被修改。
+              把本槽当前显示的定时测试整个覆盖到你有权限的全部槽（租户仅自己的槽）：
+              开关（{enabled ? '启用' : '暂停'}
+              ）、频率、时刻/分钟、星期、时区、模型、Prompt、
+              {codex ? 'effort' : 'token 上限'}。不用先点保存。
+              另一类槽（Claude/Codex 不同）只同步开关和时间，保留自己的模型与
+              Prompt。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

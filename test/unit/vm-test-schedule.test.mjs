@@ -230,3 +230,69 @@ test('unparseable stored cron surfaces parse_error without exposing cron string'
   assert.equal(view.parse_error, true)
   assert.equal(view.cron, undefined)
 })
+
+test('sync with test copies switch and dialog to every slot of the same kind', () => {
+  const codexVm = { id: 'vm-02', platform: 'openai' }
+  const otherClaude = { id: 'vm-03', platform: 'anthropic' }
+  const { settings, schedule } = runner({ list: () => [claudeVm, codexVm, otherClaude] })
+  schedule.save('vm-01', { ...claudeConfig, enabled: false })
+  schedule.save('vm-02', {
+    enabled: false,
+    frequency: 'daily',
+    time: '08:00',
+    timezone: 'UTC',
+    model: 'gpt-5.5',
+    prompt: 'codex-own',
+    max_tokens: null,
+    reasoning_effort: 'low',
+  })
+  const result = schedule.syncSchedules({
+    scope: 'all',
+    schedule: normalizeScheduleStructure({ frequency: 'hourly', minute: 0, timezone: 'Asia/Shanghai' }),
+    test: { enabled: true, model: 'claude-haiku-5-5', prompt: 'ping', max_tokens: 32 },
+  })
+  assert.deepEqual(result.updated.sort(), ['vm-01', 'vm-02', 'vm-03'])
+  for (const id of ['vm-01', 'vm-03']) {
+    const row = settings.get(`${VM_TEST_SCHEDULE_PREFIX}${id}`)
+    assert.equal(row.enabled, true)
+    assert.equal(row.model, 'claude-haiku-5-5')
+    assert.equal(row.prompt, 'ping')
+    assert.equal(row.max_tokens, 32)
+    assert.equal(row.frequency, 'hourly')
+    assert.equal(row.timezone, 'Asia/Shanghai')
+  }
+  const codex = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-02`)
+  assert.equal(codex.enabled, true, 'the switch applies to every slot')
+  assert.equal(codex.prompt, 'codex-own', 'a Codex slot keeps its own model and prompt')
+  assert.equal(codex.reasoning_effort, 'low')
+  assert.equal(codex.max_tokens, null)
+
+  schedule.syncSchedules({
+    scope: 'all',
+    schedule: normalizeScheduleStructure({ frequency: 'hourly', minute: 0, timezone: 'Asia/Shanghai' }),
+    test: { enabled: false, model: 'claude-haiku-5-5', prompt: 'ping', max_tokens: 32 },
+  })
+  for (const id of ['vm-01', 'vm-02', 'vm-03']) {
+    assert.equal(settings.get(`${VM_TEST_SCHEDULE_PREFIX}${id}`).enabled, false, 'switching off also syncs')
+  }
+})
+
+test('sync with an invalid test writes nothing', () => {
+  const { settings, schedule } = runner({ list: () => [claudeVm, { id: 'vm-03', platform: 'anthropic' }] })
+  schedule.save('vm-01', { ...claudeConfig, enabled: false })
+  const before = settings.all()
+  for (const test of [
+    { enabled: 'yes', model: 'm', prompt: 'p', max_tokens: 1 },
+    { enabled: true, model: '', prompt: 'p', max_tokens: 1 },
+    { enabled: true, model: 'm', prompt: 'p' },
+  ]) {
+    assert.throws(() =>
+      schedule.syncSchedules({
+        scope: 'all',
+        schedule: normalizeScheduleStructure({ frequency: 'hourly', minute: 0, timezone: 'Asia/Shanghai' }),
+        test,
+      }),
+    )
+  }
+  assert.deepEqual(settings.all(), before)
+})

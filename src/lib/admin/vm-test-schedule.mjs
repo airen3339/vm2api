@@ -244,6 +244,36 @@ export function normalizeVmTestSchedule(input, vm) {
   }
 }
 
+/** Validated once before any slot is written, so a bad request never half-applies. */
+function normalizeSyncTest(test, structure) {
+  if (!test || typeof test !== 'object' || Array.isArray(test)) {
+    throw new VmTestScheduleError('test must be an object')
+  }
+  if (typeof test.enabled !== 'boolean') throw new VmTestScheduleError('test.enabled must be a boolean')
+  const codex = test.reasoning_effort != null && String(test.reasoning_effort).trim() !== ''
+  const config = normalizeVmTestSchedule(
+    {
+      enabled: test.enabled,
+      ...structure,
+      model: test.model,
+      prompt: test.prompt,
+      max_tokens: test.max_tokens ?? null,
+      reasoning_effort: test.reasoning_effort ?? null,
+    },
+    { platform: codex ? 'openai' : 'anthropic' },
+  )
+  return {
+    enabled: config.enabled,
+    codex,
+    dialog: {
+      model: config.model,
+      prompt: config.prompt,
+      max_tokens: config.max_tokens,
+      reasoning_effort: config.reasoning_effort,
+    },
+  }
+}
+
 function compactError(error) {
   const code = String(error?.code || 'test_failed')
     .replace(/[\r\n\t]/g, ' ')
@@ -491,8 +521,14 @@ export class VmTestScheduleRunner {
     return this.get(vmId)
   }
 
-  syncSchedules({ scope, vmIds = [], schedule }) {
+  /**
+   * `test` copies the whole scheduled test (switch, model, prompt, token/effort).
+   * A slot of the other kind (Claude vs Codex) keeps its own dialog params, since
+   * a model of one kind cannot run on the other; switch and timing still apply.
+   */
+  syncSchedules({ scope, vmIds = [], schedule, test = null }) {
     const structure = normalizeScheduleStructure(schedule)
+    const full = test == null ? null : normalizeSyncTest(test, structure)
     let targets = []
     if (scope === 'all') {
       targets = this.listVms().map((vm) => vm.id)
@@ -510,6 +546,11 @@ export class VmTestScheduleRunner {
         missing.push(vmId)
         continue
       }
+      if (full) {
+        this._applyFullTest(vmId, structure, full)
+        updated.push(vmId)
+        continue
+      }
       const hadPlan = !!this._settings().get(keyFor(vmId))
       this.applyScheduleStructure(vmId, structure, { preserveDialog: hadPlan })
       if (!hadPlan) {
@@ -523,6 +564,24 @@ export class VmTestScheduleRunner {
       updated.push(vmId)
     }
     return { updated, missing, schedule: structure }
+  }
+
+  _applyFullTest(vmId, structure, full) {
+    const vm = this._vm(vmId)
+    const previous = this._settings().get(keyFor(vmId)) || {}
+    let dialog
+    if (isCodexVm(vm) === full.codex) dialog = full.dialog
+    else if (previous.model && previous.prompt) {
+      dialog = {
+        model: previous.model,
+        prompt: previous.prompt,
+        max_tokens: previous.max_tokens ?? null,
+        reasoning_effort: previous.reasoning_effort ?? null,
+      }
+    } else dialog = defaultDialogParams(vm)
+    const config = normalizeVmTestSchedule({ enabled: full.enabled, ...structure, ...dialog }, vm)
+    this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
+    if (this.started) this._syncJob(vmId, config)
   }
 
   remove(vmId) {

@@ -22,7 +22,7 @@ function TestBody({ vm }: { vm: Vm }) {
       credType={credTypeOf(vm)}
       isCodex={isCodexVm(vm)}
       dataplane={vm.resolved_dataplane}
-      schedule={<VmTestSchedule vm={vm} {...chat} />}
+      schedule={<VmTestSchedule key={vm.id} vm={vm} {...chat} />}
     />
   )
 }
