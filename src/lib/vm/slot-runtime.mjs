@@ -36,17 +36,28 @@ export function startSlot(vm, projectRoot, opts = {}) {
   return slotHost(vm).start(vm, projectRoot, opts)
 }
 
+/**
+ * A node slot's sockets are relay paths that the local vms/<id>/run fallback cannot
+ * rebuild, so the record must carry them. Callers that only patch status after
+ * start (create, import, recreate) would otherwise leave runtime as {type}.
+ */
+function persistNodeRuntime(vm, projectRoot, boot) {
+  if (vmNodeId(vm) && boot?.runtime) persistVmRuntime(projectRoot, vm.id, boot.runtime)
+}
+
 export async function startSlotReady(vm, projectRoot, opts = {}) {
   if (isCodexVm(vm)) {
     if (!slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
     const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
     if (!boot?.ok) return boot
+    persistNodeRuntime(vm, projectRoot, boot)
     const kernel = await ensureSlotInferenceRuntime(vm, projectRoot, opts)
     if (!kernel.ok) return kernel
     return { ok: true, engine: 'codex', docker: boot, kernel }
   }
   const boot = await startSlot(vm, projectRoot, opts)
   if (!boot?.ok) return boot
+  persistNodeRuntime(vm, projectRoot, boot)
   return attachInferenceRuntime(boot, vm, projectRoot, opts)
 }
 

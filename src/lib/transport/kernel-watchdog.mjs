@@ -7,6 +7,7 @@
  * waits; when that is spent too, the VM is marked faulted, the scheduler skips
  * it and the operator is notified. Never falls back to kin-worker hop.
  */
+import fs from 'node:fs'
 import {
   kernelFaults,
   rustKernelHealth,
@@ -24,6 +25,7 @@ import {
 import { resolveInferenceEngine } from '../vm/slot-engine.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { dockerRequest } from '../cluster/docker-remote.mjs'
+import { clusterManager, vmNodeId } from '../cluster/placement.mjs'
 
 /** A failed observation is not evidence of a dead container. Use the slot's own host, including KVM runners. */
 export async function observeWatchdogContainer(
@@ -108,6 +110,34 @@ function isTelemetryHealTarget(vm) {
   return !HARD_DOWN.has(String(vm.status || '').toLowerCase())
 }
 
+/** A node slot answers through an SSH relay across the ocean (~110ms RTT); 800ms misfires there. */
+export const NODE_SLOT_HEALTH_TIMEOUT_MS = 3000
+
+function clusterRelayPaths(nodeId, vmId) {
+  return clusterManager().slotRelayPaths(nodeId, vmId)
+}
+
+/**
+ * A node slot's kernel is reached only through its local relay; the vms/<id>/run
+ * path never holds a socket there. Null when the relay is not listening: that is
+ * a bridge fault for healBridges, never evidence that the remote kernel is dead.
+ */
+export function watchdogProbeVm(vm, { relayPaths = clusterRelayPaths, exists = fs.existsSync } = {}) {
+  const nodeId = vmNodeId(vm)
+  if (!nodeId) return vm
+  let relays
+  try {
+    relays = relayPaths(nodeId, vm.id)
+  } catch {
+    return null
+  }
+  if (!relays?.kernel || !exists(relays.kernel)) return null
+  return {
+    ...vm,
+    runtime: { ...(vm.runtime || {}), kernel_socket: relays.kernel, worker_socket: relays.worker },
+  }
+}
+
 function kernelSlotMismatch(exec) {
   const configPath = rustKernelPaths(exec).configPath
   if (!configPath) return false
@@ -128,6 +158,7 @@ export function createKernelWatchdog({
   telemetryEveryMs = TELEMETRY_HEAL_MS,
   revive = null,
   healBridges = null,
+  probeVm = watchdogProbeVm,
   now = () => Date.now(),
 } = {}) {
   let config = normalizeKernelWatchdogConfig(initial)
@@ -197,13 +228,27 @@ export function createKernelWatchdog({
   }
 
   /** One VM's check. `held` is re-read after every await: an operator cycle may start mid-check. */
+  async function reviveDownContainer(vm, state) {
+    if (vm.status !== 'running' || typeof revive !== 'function') return
+    if (!admitRestart(vm, `container ${state}`, now())) return
+    const revived = await revive(vm)
+    if (!revived?.ok) console.warn(`[kernel-watchdog] ${vm.id} boot failed: ${revived?.error || revived?.code}`)
+  }
+
   async function checkVm(vm, routing) {
+    const probed = probeVm(vm)
+    if (!probed) {
+      // The kernel cannot be probed without its relay; only a container that is really down is revived.
+      const observed = await observeRuntime(vm)
+      if (held.has(vm.id) || !['missing', 'stopped', 'restarting'].includes(observed?.state)) return
+      return reviveDownContainer(vm, observed.state)
+    }
     const exec = {
       vmId: vm.id,
-      vm,
+      vm: probed,
       homeDir: typeof homeDirFor === 'function' ? homeDirFor(vm) : null,
     }
-    const current = await health(exec, { timeoutMs: 800 })
+    const current = await health(exec, { timeoutMs: vmNodeId(vm) ? NODE_SLOT_HEALTH_TIMEOUT_MS : 800 })
     if (held.has(vm.id)) return
     // cc-node is the crag worker. Restarting a live kernel SIGKILLs it.
     if (dataplaneUsesCcNode(exec) && rustKernelProcessUp(current)) return
@@ -223,13 +268,7 @@ export function createKernelWatchdog({
     if (held.has(vm.id)) return
     // Permission/transport failures and deliberately paused containers never authorize recovery.
     if (!['running', 'missing', 'stopped', 'restarting'].includes(observed?.state)) return
-    if (observed.state !== 'running') {
-      if (vm.status !== 'running' || typeof revive !== 'function') return
-      if (!admitRestart(vm, `container ${observed.state}`, now())) return
-      const revived = await revive(vm)
-      if (!revived?.ok) console.warn(`[kernel-watchdog] ${vm.id} boot failed: ${revived?.error || revived?.code}`)
-      return
-    }
+    if (observed.state !== 'running') return reviveDownContainer(vm, observed.state)
     if (!admitRestart(vm, reason, now())) return
     console.warn(`[kernel-watchdog] ${vm.id} restarting container: ${reason}`)
     const result = await ensure(exec, { timeoutMs: config.timeout_ms })
